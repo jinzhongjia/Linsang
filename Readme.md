@@ -3,27 +3,46 @@
 A small, embeddable **HTTP/1.1 + WebSocket** server library in Zig 0.16, in the
 spirit of [civetweb](https://github.com/civetweb/civetweb).
 
-- **No `std.http`** and **no `std.Io.net`** — the socket and protocol code is our own.
+- **No `std.http`** — the HTTP + WebSocket protocol code is our own.
+- Networking uses **`std.Io.net`** on the **`std.Io` runtime** (one fiber per
+  connection), so we don't hand-roll per-OS socket code.
 - **No third-party dependencies.**
-- **No libc** on Linux (raw syscalls) and Windows (system DLLs, not the C runtime).
-  macOS necessarily links `libSystem` — Apple provides no stable syscall ABI, and
-  Zig always links it for Darwin.
-- **Low memory**: shared-nothing per-thread reactor, pooled fixed-size connection
-  buffers, zero-copy request bodies.
-- **Heavily unit-tested**: 41 tests covering the parser, chunked decoding, the
-  WebSocket codec (incl. the RFC 6455 accept vector), the connection state machine
-  over socketpairs, and end-to-end HTTP + WebSocket over real TCP with worker threads.
+- **No libc** where the OS allows: Linux (Evented → io_uring) and Windows
+  (Threaded → `kernel32`/`ws2_32`, not the C runtime). macOS necessarily links
+  `libSystem` (Evented → Dispatch/GCD; Apple provides no stable syscall ABI).
+- **Low memory**: bounded per-connection buffers, zero-copy `Content-Length`
+  bodies. Each connection carries a (lazily-committed) fiber stack.
+- **Heavily unit-tested**: parser, chunked decoding, WebSocket codec (incl. the
+  RFC 6455 accept vector), and end-to-end HTTP + WebSocket over real TCP.
+
+> **Status:** migrating the networking layer to `std.Io.net` + `std.Io.Evented`.
+> `http.zig` and `websocket.zig` (protocol code) are stable; `connection.zig` and
+> `server.zig` are being rewritten around `std.Io.net` (the previous hand-rolled
+> socket/poller/reactor is being removed). See [docs/DESIGN.md](docs/DESIGN.md).
+
+## Concurrency runtime
+
+The library takes an `io: std.Io` and threads it through. Callers choose:
+
+- **`std.Io.Evented`** (recommended) — fiber-based event loop:
+  Linux → **io_uring**, \*BSD → kqueue, macOS → **Dispatch/GCD**,
+  **Windows → not available**.
+- **`std.Io.Threaded`** — thread-pool blocking; the **required fallback on Windows**.
+
+A blocking `read`/`write` suspends the connection's fiber, not the OS thread, so
+many connections share a small thread pool. Fibers are supported on `x86_64`,
+`aarch64`, `riscv64`.
 
 ## Platforms
 
-| OS | Backend | Status |
+| OS | Runtime | Status |
 |----|---------|--------|
-| Linux | epoll + raw syscalls (no libc) | runtime-tested |
-| macOS | kqueue + `std.c`/libSystem | cross-compile-verified |
-| Windows | WSAPoll + `ws2_32` | cross-compile-verified |
+| Linux | `std.Io.Evented` → io_uring (no libc) | runtime-tested |
+| macOS | `std.Io.Evented` → Dispatch/GCD (libSystem) | cross-compile-verified |
+| Windows | `std.Io.Threaded` (`ws2_32`, no CRT) | cross-compile-verified |
 
 `x86_64` and `aarch64` both cross-compile. macOS/Windows are compiled and
-type-checked here but not runtime-tested (no host available in this environment).
+type-checked but not runtime-tested (no host available in this environment).
 
 ## Build
 
@@ -35,7 +54,11 @@ zig build         # build the demo binary into zig-out/bin/linsang
 
 ## Use as a library
 
+The API threads a `std.Io` instance through the server (final shape lands with
+the migration):
+
 ```zig
+const std = @import("std");
 const linsang = @import("Linsang");
 
 fn onRequest(req: *const linsang.Request, res: *linsang.Response, ud: ?*anyopaque) linsang.Action {
@@ -53,27 +76,32 @@ fn onMessage(conn: *linsang.Connection, msg: linsang.websocket.Message, ud: ?*an
 }
 
 pub fn main() !void {
-    var server = linsang.Server.init(std.heap.page_allocator, .{
+    const gpa = std.heap.page_allocator;
+
+    var evented: std.Io.Evented = undefined;
+    try evented.init(gpa, .{}); // Threaded on Windows
+    defer evented.deinit();
+    const io = evented.io();
+
+    var server = linsang.Server.init(gpa, .{
         .address = "0.0.0.0",
         .port = 8080,
         .on_request = onRequest,
         .on_ws_message = onMessage, // optional
     });
-    try server.start(); // spawns one reactor per CPU
-    server.wait();      // block until stop()
+    try server.run(io); // accept loop + one fiber per connection
 }
 ```
 
-`Config` knobs: `threads` (0 = one per CPU), `read_buffer_size`, `max_body_size`,
-`max_ws_message_size`, `backlog`, `pool_capacity`, `user_data`, and the
-`on_ws_open`/`on_ws_close` hooks.
+`Config` knobs: `read_buffer_size`, `max_body_size`, `max_ws_message_size`,
+`backlog`, `user_data`, and the `on_ws_open`/`on_ws_close` hooks.
 
 ## Design
 
-See [docs/DESIGN.md](docs/DESIGN.md). In short: one shared listen socket, `N`
-worker threads each running an independent readiness reactor; a connection lives
-entirely inside one worker, so there are no locks on the hot path. HTTP handlers
-run synchronously in the reactor and must not block.
+See [docs/DESIGN.md](docs/DESIGN.md). In short: `IpAddress.listen(io)` → accept
+loop → one fiber per connection via `std.Io.Group`. A connection lives entirely
+inside its fiber, so there are no locks on the hot path. Handlers run in the fiber
+and may block on `io` operations, but must not make foreign OS-blocking calls.
 
 ## Scope
 
@@ -81,5 +109,5 @@ run synchronously in the reactor and must not block.
 WebSocket handshake + framing + fragmentation + ping/pong/close.
 
 **Out (by design):** HTTP/2, pipelining, compression, multipart. **TLS is a
-planned Phase 2** (TLS 1.3 server built on `std.crypto` primitives) — not in this
-release.
+planned Phase 2** (TLS 1.3 over a transport seam on `Stream`, built on
+`std.crypto` primitives) — not in this release.

@@ -6,18 +6,35 @@ design; this file is the working brief.
 ## What this is
 
 A small embeddable **HTTP/1.1 + WebSocket** server library in **Zig 0.16**, in the
-spirit of civetweb. Phase 1 (plaintext) is done. TLS 1.3 is Phase 2 (not started).
+spirit of civetweb. Plaintext phase. TLS 1.3 is Phase 2 (not started).
+
+## Status: migration in progress (read this first)
+
+We are moving the networking layer to **`std.Io.net`** driven by the **`std.Io`
+runtime** (Evented / io_uring), **one fiber per connection**.
+
+- **Keep**: `http.zig`, `websocket.zig` (pure protocol code — reused verbatim).
+- **Replace / remove**: `socket.zig` and `poller.zig` (hand-rolled per-OS sockets +
+  readiness poller) go away. `connection.zig` and `server.zig` are rewritten around
+  `std.Io.net` (straight-line fiber handler instead of a reactor state machine).
+- The current tree still has the old hand-rolled version until the rewrite lands.
+  When editing, target the new design; don't invest further in `socket.zig`/`poller.zig`.
 
 ## Hard constraints (do not violate)
 
-- **No `std.http`** and **no `std.Io.net`** — we own the socket + protocol code.
+- **No `std.http`** — we own the HTTP + WebSocket protocol code.
+- **`std.Io.net` IS allowed and used** for sockets + address parsing (it is not
+  `std.http`). Do not re-hand-roll per-OS socket backends.
 - **No third-party dependencies.**
-- **No libc** on Linux (raw `std.os.linux` syscalls) and Windows (`ws2_32`/`kernel32`,
-  not the C runtime). **macOS is the exception**: `libSystem` is mandatory (Apple has
-  no stable syscall ABI, Zig always links it) — that's accepted, not a bug to fix.
-- **Low memory**: fixed per-connection buffers, pooled connections, zero-copy bodies.
-- **Heavy unit tests**: every non-trivial function keeps a runnable test. Don't add
-  logic without a test.
+- **No libc** where the OS allows: Linux (Evented → io_uring, raw syscalls) and
+  Windows (Threaded → `kernel32`/`ws2_32`, not the C runtime). **macOS is the
+  exception**: Evented → Dispatch/GCD which is `libSystem`, and macOS forces
+  `libSystem` regardless — accepted, not a bug.
+- **Low memory**: bounded per-connection buffers, zero-copy `Content-Length`
+  bodies. NOTE: each connection now also carries a fiber stack (lazily committed) —
+  heavier than the old state machine, accepted for stdlib-tested networking. Keep
+  buffers bounded and handler stacks shallow.
+- **Heavy unit tests**: every non-trivial function keeps a runnable test.
 
 ## Commands
 
@@ -31,65 +48,77 @@ zig build -Dtarget=<t>         # cross-compile check (see targets below)
 Cross-compile matrix that must keep compiling:
 `x86_64-linux aarch64-linux x86_64-macos aarch64-macos x86_64-windows`.
 
-## Architecture
+## Architecture (target)
 
-Shared-nothing per-thread reactor: one shared listen socket, `N` worker threads
-(default = CPU count), each running its own readiness poller. A connection lives
-entirely inside one worker → **no locks on the hot path**. Handlers run
-synchronously inside the reactor and **must not block**.
+The library takes an `io: std.Io` and threads it through. Callers pick the runtime:
 
-Module map (all under `src/`):
+- **`std.Io.Evented`** (recommended): Linux → **io_uring**, *BSD → kqueue,
+  macOS → **Dispatch/GCD**, **Windows → not available (`void`)**.
+- **`std.Io.Threaded`**: thread-pool blocking; the **required Windows fallback**.
+
+`fiber.supported` = `x86_64`, `aarch64`, `riscv64`.
+
+Flow: `IpAddress.listen(io)` → loop `Server.accept(io)` → per `Stream`,
+`std.Io.Group.async(io, handleConn, …)`. Each connection lives in its own fiber
+(no locks). Blocking `read`/`write` suspends the fiber, not the thread. Handlers
+run in the fiber; they may block on `io` ops but must not make foreign OS-blocking
+calls.
+
+Module map (target, all under `src/`):
 
 | File | Role |
 |---|---|
 | `root.zig` | public API re-exports + test aggregator |
-| `main.zig` | demo server (`zig build run`) |
-| `socket.zig` | per-OS TCP ops behind one interface |
-| `poller.zig` | per-OS readiness poller behind one interface |
-| `http.zig` | `Method`/`Status`/`Request`/`Response` + incremental parser + chunked decoder |
-| `websocket.zig` | RFC 6455 handshake + frame codec + `Assembler` |
-| `connection.zig` | per-connection state machine + `Config`/handler API + `Pool` |
-| `server.zig` | `Server`: threads + accept + reactor loop |
+| `main.zig` | demo: build an `Evented` `io`, run the server |
+| `http.zig` | `Method`/`Status`/`Request`/`Response` + parser + chunked decoder *(unchanged)* |
+| `websocket.zig` | RFC 6455 handshake + frame codec + `Assembler` *(unchanged)* |
+| `connection.zig` | straight-line per-connection handler + `Config`/handler API |
+| `server.zig` | `std.Io.net` listen + accept loop + fiber-per-connection |
+
+## std.Io.net / runtime facts (0.16, verified)
+
+- `IpAddress.parse/loopback/unspecified`, `.listen(io, options) → Server`,
+  `Server.accept(io) → Stream`.
+- `Stream.reader(io, buf) / .writer(io, buf) / .close(io) / .shutdown(io, how)`;
+  `Stream.socket.handle` is the raw fd/SOCKET.
+- Raw read for the incremental parser: `io.vtable.netRead(io.userdata, handle, &.{buf})`
+  → bytes (0 = EOF). Simple writes: `Stream.writer` → `interface.writeAll` + `flush`.
+- Runtime: `std.Io.Evented.init(backing_allocator, .{ .thread_limit = … })`,
+  `ev.io()`, `ev.deinit()`. Spawn work with `std.Io.Group` (`g.async(io, fn, args)`,
+  `g.wait(io)` / `g.cancel(io)`), or `io.async` / `io.concurrent`.
+- `Server.AcceptOptions` is `void` on posix, a struct on Windows — handle both.
+
+## Zig 0.16 gotchas still relevant
+
+- `std.ArrayList(T)` is unmanaged: init with `.empty`, methods take the allocator.
+- Raw Linux syscalls (in `http.zig`/tests only now) return `usize`; convert with
+  `std.os.linux.errno(rc)` → `linux.E` (no `E.init`).
+- Reader/Writer are `std.Io.Reader`/`Io.Writer` with a `.interface` field; pass
+  `&x.interface`. Pass real buffers.
+
+### Obsolete gotchas (were for the removed hand-rolled layer)
+
+These no longer apply once `socket.zig`/`poller.zig` are gone; kept as history:
+hand-declared `ws2_32` externs, `SOCKET`/`invalid_handle` sentinel, `std.posix`
+socket wrappers being removed, `std.c.kevent` non-null lists, kqueue per-filter
+event coalescing. `std.Io.net` handles all of this now.
 
 ## Conventions
 
-- **Test aggregation**: `root.zig` has `test { _ = module; ... }` for every file.
-  When you add `src/foo.zig`, add `pub const foo = @import("foo.zig");` and `_ = foo;`
-  or its tests won't run.
-- **Per-OS dispatch**: `socket.zig`/`poller.zig` pick a backend at comptime
-  (`const impl = switch (builtin.os.tag) {...}`; `const Poller = switch ...`). Keep the
-  public surface OS-agnostic; put OS specifics in the backend struct.
-- **`// ponytail:` comments** mark deliberate simplifications with their upgrade path.
-  Respect them; don't "fix" a documented shortcut without reason.
-- **Platform status**: Linux is runtime-tested. macOS (kqueue/`std.c`) and Windows
-  (WSAPoll/`ws2_32`) are **cross-compile-verified only** — no host to run them here.
-  Linux-only tests guard with `if (builtin.os.tag != .linux) return error.SkipZigTest`.
-
-## Zig 0.16 gotchas already hit (save yourself the round-trips)
-
-- `std.posix.socket/bind/listen/accept` are **removed**; only `poll`/`setsockopt`
-  survive. `std.posix.poll` is `@compileError` on Windows.
-- Raw Linux syscalls return `usize`; convert with **`std.os.linux.errno(rc)`** →
-  `linux.E` (there is no `E.init`). For libc backends use `std.posix.errno(rc)`
-  (returns `.SUCCESS` unless `rc == -1`).
-- epoll constants live under `std.os.linux.EPOLL.{IN,OUT,ERR,HUP,RDHUP,CTL_ADD,...}`.
-- **std provides NO Winsock function bindings** — declare `extern "ws2_32"` yourself
-  (see `socket.zig`'s `win` struct). `SOCKET` is `usize`; use `socket.invalid_handle`,
-  never `-1`, for the sentinel (Handle is unsigned on Windows).
-- `std.once` does **not** exist — use an atomic guard.
-- `std.c.kevent`'s changelist/eventlist are non-optional `[*]Kevent`; pass a dummy
-  non-null pointer (e.g. `&self.raw`) even when the count is 0.
-- `std.ArrayList(T)` is unmanaged: init with `.empty`, methods take the allocator.
-- kqueue emits one event **per filter**; `poller.zig` coalesces to one `Event` per fd
-  so the reactor can close an fd without a stale second event (use-after-free).
+- **Test aggregation**: `root.zig` has `test { _ = module; … }` per file. New file
+  `src/foo.zig` → add `pub const foo = @import("foo.zig");` and `_ = foo;`.
+- **`// ponytail:` comments** mark deliberate simplifications with their upgrade
+  path. Respect them.
+- **Platform status**: Linux is runtime-tested. macOS (Dispatch) and Windows
+  (Threaded) are cross-compile-verified only. Linux-only tests guard with
+  `if (builtin.os.tag != .linux) return error.SkipZigTest`.
 
 ## Scope
 
 **In**: keep-alive, `Content-Length` + chunked (both directions), WebSocket
 handshake/framing/fragmentation/ping-pong-close.
 **Out**: HTTP/2, pipelining, compression, multipart, streaming response bodies.
-**Phase 2**: TLS 1.3 server on `std.crypto` primitives — introduce a transport seam
-in `connection.zig` then (Phase 1 does IO directly on the fd).
+**Phase 2**: TLS 1.3 over a transport seam on `Stream`, built on `std.crypto`.
 
 ## Guardrails
 
