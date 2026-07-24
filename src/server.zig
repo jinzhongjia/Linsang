@@ -128,7 +128,7 @@ test "listen and serve HTTP over std.Io.net TCP" {
     defer client.close(io);
     var write_buffer: [128]u8 = undefined;
     var writer = client.writer(io, &write_buffer);
-    try writer.interface.writeAll("GET /road HTTP/1.1\r\nConnection: close\r\n\r\n");
+    try writer.interface.writeAll("GET /road HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
     try writer.interface.flush();
 
     var response: [512]u8 = undefined;
@@ -188,7 +188,7 @@ fn stressClient(io: std.Io, address: std.Io.net.IpAddress, id: usize) anyerror!v
         try writer.interface.writeAll("GET /slow")
     else
         try writer.interface.print(
-            "GET /{d} HTTP/1.1\r\nConnection: close\r\n\r\n",
+            "GET /{d} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
             .{id},
         );
     try writer.interface.flush();

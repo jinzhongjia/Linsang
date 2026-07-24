@@ -43,6 +43,10 @@ pub fn checkUpgrade(req: *const http.Request) Upgrade {
 
     const ver = req.header("sec-websocket-version") orelse return .version_mismatch;
     if (!std.mem.eql(u8, std.mem.trim(u8, ver, " \t"), "13")) return .version_mismatch;
+    var decoded: [16]u8 = undefined;
+    const decoder = std.base64.standard.Decoder;
+    if ((decoder.calcSizeForSlice(key) catch return .no) != decoded.len) return .no;
+    decoder.decode(&decoded, key) catch return .no;
     return .{ .yes = key };
 }
 
@@ -185,6 +189,11 @@ pub fn writeFrame(out: *std.ArrayList(u8), gpa: Allocator, opcode: Opcode, paylo
     try out.appendSlice(gpa, payload);
 }
 
+pub fn writeText(out: *std.ArrayList(u8), gpa: Allocator, payload: []const u8) !void {
+    if (!std.unicode.utf8ValidateSlice(payload)) return error.InvalidUtf8;
+    try writeFrame(out, gpa, .text, payload, true);
+}
+
 pub fn writeClose(out: *std.ArrayList(u8), gpa: Allocator, code: CloseCode, reason: []const u8) !void {
     var payload: [125]u8 = undefined;
     std.mem.writeInt(u16, payload[0..2], @intFromEnum(code), .big);
@@ -287,14 +296,19 @@ test "checkUpgrade negatives" {
     try testing.expect(checkUpgrade(&req) == .no);
 
     req.reset();
-    _ = http.parseHead(&req, "GET / HTTP/1.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n" ++
+    _ = http.parseHead(&req, "GET / HTTP/1.1\r\nHost: a\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n" ++
         "Sec-WebSocket-Key: x\r\nSec-WebSocket-Version: 8\r\n\r\n");
     try testing.expect(checkUpgrade(&req) == .version_mismatch);
 
     req.reset();
-    _ = http.parseHead(&req, "POST / HTTP/1.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n" ++
-        "Sec-WebSocket-Key: x\r\nSec-WebSocket-Version: 13\r\n\r\n");
+    _ = http.parseHead(&req, "POST / HTTP/1.1\r\nHost: a\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n" ++
+        "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n");
     try testing.expect(checkUpgrade(&req) == .no); // not GET
+
+    req.reset();
+    _ = http.parseHead(&req, "GET / HTTP/1.1\r\nHost: a\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n" ++
+        "Sec-WebSocket-Key: x\r\nSec-WebSocket-Version: 13\r\n\r\n");
+    try testing.expect(checkUpgrade(&req) == .no);
 }
 
 test "writeAccept response" {
@@ -356,16 +370,17 @@ test "parseFrame 16-bit extended length" {
     try testing.expectEqual(Opcode.binary, r.done.frame.opcode);
 }
 
-test "writeFrame small/medium and round-trip via parse" {
+test "writeText validates UTF-8 and round-trips via parse" {
     const gpa = testing.allocator;
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(gpa);
-    try writeFrame(&out, gpa, .text, "hello", true);
+    try writeText(&out, gpa, "hello");
     try testing.expectEqual(@as(u8, 0x81), out.items[0]);
     try testing.expectEqual(@as(u8, 5), out.items[1]); // unmasked, len 5
     // Server frames are unmasked: parse with require_mask=false.
     const r = parseFrame(out.items, false);
     try testing.expectEqualStrings("hello", r.done.frame.payload);
+    try testing.expectError(error.InvalidUtf8, writeText(&out, gpa, &.{0xff}));
 }
 
 test "writeClose encodes code + reason" {

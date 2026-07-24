@@ -62,7 +62,7 @@ fn fuzzProtocolParsers(_: void, smith: *std.testing.Smith) !void {
 test "protocol parsers tolerate arbitrary input" {
     try std.testing.fuzz({}, fuzzProtocolParsers, .{
         .corpus = &.{
-            "GET / HTTP/1.1\r\n\r\n",
+            "GET / HTTP/1.1\r\nHost: x\r\n\r\n",
             "4\r\nWiki\r\n0\r\n\r\n",
             "\x81\x82\x01\x02\x03\x04Hi",
         },

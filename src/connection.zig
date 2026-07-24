@@ -361,7 +361,7 @@ pub const Connection = struct {
     }
 
     pub fn sendText(self: *Connection, data: []const u8) !void {
-        try websocket.writeFrame(&self.write_buf, self.gpa, .text, data, true);
+        try websocket.writeText(&self.write_buf, self.gpa, data);
     }
 
     pub fn sendBinary(self: *Connection, data: []const u8) !void {
@@ -554,7 +554,7 @@ test "HTTP keep-alive and parse error over std.Io.net" {
     var group: std.Io.Group = .init;
     group.async(io, runTestConnection, .{ io, server, &cfg });
 
-    try writeTest(client, io, "GET /one HTTP/1.1\r\n\r\n");
+    try writeTest(client, io, "GET /one HTTP/1.1\r\nHost: x\r\n\r\n");
     var response: [512]u8 = undefined;
     const first = try readUntil(client, io, &response, "path=/one");
     try testing.expect(std.mem.startsWith(u8, first, "HTTP/1.1 200 OK\r\n"));
@@ -583,7 +583,7 @@ test "chunked body may arrive in pieces" {
     var group: std.Io.Group = .init;
     group.async(io, runTestConnection, .{ io, server, &cfg });
 
-    try writeTest(client, io, "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n4\r\nWi");
+    try writeTest(client, io, "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n4\r\nWi");
     try writeTest(client, io, "ki\r\n5\r\npedia\r\n0\r\n\r\n");
     var response: [512]u8 = undefined;
     const complete = try readUntil(client, io, &response, "Wikipedia");
@@ -604,7 +604,7 @@ test "Expect continue and HEAD response semantics" {
     var group: std.Io.Group = .init;
     group.async(io, runTestConnection, .{ io, server, &cfg });
 
-    try writeTest(client, io, "POST / HTTP/1.1\r\nExpect: 100-continue\r\nContent-Length: 3\r\n\r\n");
+    try writeTest(client, io, "POST / HTTP/1.1\r\nHost: x\r\nExpect: 100-continue\r\nContent-Length: 3\r\n\r\n");
     var response: [512]u8 = undefined;
     const interim = try readUntil(client, io, &response, "\r\n\r\n");
     try testing.expectEqualStrings("HTTP/1.1 100 Continue\r\n\r\n", interim);
@@ -612,7 +612,7 @@ test "Expect continue and HEAD response semantics" {
     const posted = try readUntil(client, io, &response, "abc");
     try testing.expect(std.mem.endsWith(u8, posted, "abc"));
 
-    try writeTest(client, io, "HEAD / HTTP/1.1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+    try writeTest(client, io, "HEAD / HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
     const head = try readUntil(client, io, &response, "\r\n\r\n");
     try testing.expect(std.mem.indexOf(u8, head, "Content-Length: 0\r\n") != null);
     var byte: [1]u8 = undefined;
@@ -674,7 +674,7 @@ test "idle keep-alive closes and WebSocket close payloads are validated" {
     var group: std.Io.Group = .init;
     group.async(io, runTestConnection, .{ io, server, &cfg });
 
-    try writeTest(client, io, "GET /idle HTTP/1.1\r\n\r\n");
+    try writeTest(client, io, "GET /idle HTTP/1.1\r\nHost: x\r\n\r\n");
     var response: [256]u8 = undefined;
     _ = try readUntil(client, io, &response, "path=/idle");
     var byte: [1]u8 = undefined;

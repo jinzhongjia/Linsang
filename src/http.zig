@@ -52,6 +52,7 @@ pub const Status = enum(u16) {
     length_required = 411,
     payload_too_large = 413,
     uri_too_long = 414,
+    expectation_failed = 417,
     upgrade_required = 426,
     request_header_fields_too_large = 431,
     internal_server_error = 500,
@@ -79,6 +80,7 @@ pub const Status = enum(u16) {
             .length_required => "Length Required",
             .payload_too_large => "Payload Too Large",
             .uri_too_long => "URI Too Long",
+            .expectation_failed => "Expectation Failed",
             .upgrade_required => "Upgrade Required",
             .request_header_fields_too_large => "Request Header Fields Too Large",
             .internal_server_error => "Internal Server Error",
@@ -235,17 +237,26 @@ fn parseRequestLine(req: *Request, line: []const u8) LineResult {
 }
 
 fn deriveBodyFraming(req: *Request) LineResult {
+    var host_count: usize = 0;
+    for (req.headers()) |header| {
+        if (std.ascii.eqlIgnoreCase(header.name, "host")) {
+            host_count += 1;
+            if (header.value.len == 0) return .{ .fail = .bad_request };
+        } else if (std.ascii.eqlIgnoreCase(header.name, "expect")) {
+            if (!std.ascii.eqlIgnoreCase(header.value, "100-continue"))
+                return .{ .fail = .expectation_failed };
+            req.expect_continue = req.minor_version >= 1;
+        }
+    }
+    if (host_count > 1 or (req.minor_version >= 1 and host_count != 1))
+        return .{ .fail = .bad_request };
+
     // keep-alive default: 1.1 on, 1.0 off, adjusted by Connection.
     req.keep_alive = req.minor_version >= 1;
     if (req.header("connection")) |c| {
         if (headerHasToken(c, "close")) req.keep_alive = false;
         if (headerHasToken(c, "keep-alive")) req.keep_alive = true;
     }
-    if (req.header("expect")) |e| {
-        if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, e, " \t"), "100-continue"))
-            req.expect_continue = true;
-    }
-
     const te = req.header("transfer-encoding");
     const cl = req.header("content-length");
     if (te != null and cl != null) return .{ .fail = .bad_request }; // smuggling
@@ -404,17 +415,21 @@ pub const Response = struct {
 
     fn serializeImpl(self: *const Response, out: *std.ArrayList(u8), gpa: Allocator, keep_alive: bool, include_body: bool) !void {
         var line: [64]u8 = undefined;
+        const status_code = @intFromEnum(self.status);
+        const body_forbidden = status_code < 200 or self.status == .no_content or self.status == .not_modified;
         const status_line = std.fmt.bufPrint(&line, "HTTP/1.1 {d} {s}\r\n", .{
-            @intFromEnum(self.status), self.status.phrase(),
+            status_code, self.status.phrase(),
         }) catch unreachable;
         try out.appendSlice(gpa, status_line);
         try out.appendSlice(gpa, self.header_lines.items);
 
-        const cl = std.fmt.bufPrint(&line, "Content-Length: {d}\r\n", .{self.body_buf.items.len}) catch unreachable;
-        try out.appendSlice(gpa, cl);
+        if (status_code >= 200 and self.status != .no_content) {
+            const cl = std.fmt.bufPrint(&line, "Content-Length: {d}\r\n", .{self.body_buf.items.len}) catch unreachable;
+            try out.appendSlice(gpa, cl);
+        }
         try out.appendSlice(gpa, if (keep_alive) "Connection: keep-alive\r\n" else "Connection: close\r\n");
         try out.appendSlice(gpa, "\r\n");
-        if (include_body) try out.appendSlice(gpa, self.body_buf.items);
+        if (include_body and !body_forbidden) try out.appendSlice(gpa, self.body_buf.items);
     }
 };
 
@@ -480,28 +495,37 @@ test "keep-alive rules" {
     try testing.expect(req.keep_alive);
 
     req.reset();
-    _ = expectDone(parseHead(&req, "GET / HTTP/1.1\r\nConnection: close\r\n\r\n"));
+    _ = expectDone(parseHead(&req, "GET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n"));
     try testing.expect(!req.keep_alive);
 }
 
 test "content-length parsed" {
     var req: Request = .{};
-    _ = expectDone(parseHead(&req, "POST / HTTP/1.1\r\nContent-Length: 42\r\n\r\n"));
+    _ = expectDone(parseHead(&req, "POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 42\r\n\r\n"));
     try testing.expectEqual(@as(u64, 42), req.content_length.?);
     try testing.expect(!req.chunked);
 }
 
 test "chunked flagged" {
     var req: Request = .{};
-    _ = expectDone(parseHead(&req, "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n"));
+    _ = expectDone(parseHead(&req, "POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n"));
     try testing.expect(req.chunked);
     try testing.expect(req.content_length == null);
 }
 
-test "expect: 100-continue" {
+test "Host and Expect requirements" {
     var req: Request = .{};
-    _ = expectDone(parseHead(&req, "POST / HTTP/1.1\r\nExpect: 100-continue\r\nContent-Length: 3\r\n\r\n"));
+    _ = expectDone(parseHead(&req, "POST / HTTP/1.1\r\nHost: a\r\nExpect: 100-continue\r\nContent-Length: 3\r\n\r\n"));
     try testing.expect(req.expect_continue);
+    req.reset();
+    try testing.expectEqual(Status.expectation_failed, parseHead(&req, "GET / HTTP/1.1\r\nHost: a\r\nExpect: magic\r\n\r\n").fail);
+    req.reset();
+    try testing.expectEqual(Status.bad_request, parseHead(&req, "GET / HTTP/1.1\r\n\r\n").fail);
+    req.reset();
+    try testing.expectEqual(Status.bad_request, parseHead(&req, "GET / HTTP/1.1\r\nHost: a\r\nHost: b\r\n\r\n").fail);
+    req.reset();
+    _ = expectDone(parseHead(&req, "POST / HTTP/1.0\r\nExpect: 100-continue\r\nContent-Length: 3\r\n\r\n"));
+    try testing.expect(!req.expect_continue);
 }
 
 test "rejects: bad version, bad method chars, folding, smuggling, bad CL" {
@@ -516,11 +540,11 @@ test "rejects: bad version, bad method chars, folding, smuggling, bad CL" {
     req.reset();
     try testing.expectEqual(Status.bad_request, parseHead(&req, "GET / HTTP/1.1\r\n bad: fold\r\n\r\n").fail);
     req.reset();
-    try testing.expectEqual(Status.bad_request, parseHead(&req, "POST / HTTP/1.1\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n").fail);
+    try testing.expectEqual(Status.bad_request, parseHead(&req, "POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n").fail);
     req.reset();
-    try testing.expectEqual(Status.bad_request, parseHead(&req, "POST / HTTP/1.1\r\nContent-Length: 1x\r\n\r\n").fail);
+    try testing.expectEqual(Status.bad_request, parseHead(&req, "POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 1x\r\n\r\n").fail);
     req.reset();
-    try testing.expectEqual(Status.not_implemented, parseHead(&req, "POST / HTTP/1.1\r\nTransfer-Encoding: gzip\r\n\r\n").fail);
+    try testing.expectEqual(Status.not_implemented, parseHead(&req, "POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: gzip\r\n\r\n").fail);
     req.reset();
     try testing.expectEqual(Status.bad_request, parseHead(&req, "GET  HTTP/1.1\r\n\r\n").fail);
 }
@@ -614,6 +638,30 @@ test "Response.serializeHead preserves length without body" {
     try res.serializeHead(&out, gpa, false);
     try testing.expectEqualStrings(
         "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\n",
+        out.items,
+    );
+}
+
+test "Response omits bodies forbidden by status" {
+    const gpa = testing.allocator;
+    var res = Response.init(gpa);
+    defer res.deinit();
+    try res.write("hello");
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    res.status = .no_content;
+    try res.serialize(&out, gpa, true);
+    try testing.expectEqualStrings(
+        "HTTP/1.1 204 No Content\r\nConnection: keep-alive\r\n\r\n",
+        out.items,
+    );
+
+    out.clearRetainingCapacity();
+    res.status = .not_modified;
+    try res.serialize(&out, gpa, false);
+    try testing.expectEqualStrings(
+        "HTTP/1.1 304 Not Modified\r\nContent-Length: 5\r\nConnection: close\r\n\r\n",
         out.items,
     );
 }
