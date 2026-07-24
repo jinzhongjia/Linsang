@@ -48,13 +48,15 @@ pub const Server = struct {
             };
             if (active.fetchAdd(1, .monotonic) >= self.config.max_connections) {
                 _ = active.fetchSub(1, .monotonic);
-                var buffer: [128]u8 = undefined;
-                var writer = stream.writer(io, &buffer);
-                writer.interface.writeAll(
-                    "HTTP/1.1 503 Service Unavailable\r\n" ++
-                        "Content-Length: 0\r\nConnection: close\r\n\r\n",
-                ) catch {};
-                writer.interface.flush() catch {};
+                if (self.config.tls == null) {
+                    var buffer: [128]u8 = undefined;
+                    var writer = stream.writer(io, &buffer);
+                    writer.interface.writeAll(
+                        "HTTP/1.1 503 Service Unavailable\r\n" ++
+                            "Content-Length: 0\r\nConnection: close\r\n\r\n",
+                    ) catch {};
+                    writer.interface.flush() catch {};
+                }
                 stream.shutdown(io, .send) catch {};
                 // ponytail: 1 ms drain avoids TCP RST; use a bounded reject group
                 // only if overload-response throughput matters.

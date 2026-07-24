@@ -101,6 +101,8 @@ This uses the pure protocol code in `http.zig` (`parseHead`, `decodeChunked`,
 - Responses may be buffered and written with `Content-Length`, or streamed one
   chunk at a time. HTTP/1.1 streaming uses chunked framing; HTTP/1.0 streaming
   closes the connection to delimit the body.
+- TLS connections add one bounded ciphertext input buffer and one bounded
+  ciphertext output buffer on the connection fiber stack.
 - **Per-connection cost now also includes a fiber stack** (lazily committed).
   This is heavier than the previous state-machine-per-connection but was accepted
   in exchange for stdlib-tested networking and simpler code. Keep buffers bounded
@@ -142,16 +144,24 @@ cancels the connection group, waits for task cleanup, and closes the listener.
 | `src/main.zig` | demo server: builds a Threaded `io` and runs the server |
 | `src/http.zig` | `Method`, `Status`, `Request`, `Response`, incremental parser, chunked decoder |
 | `src/websocket.zig` | RFC 6455 handshake + frame codec + `Assembler` |
+| `src/tls/` | TLS 1.2/1.3 server handshake, record protection, key/certificate parsing |
 | `src/connection.zig` | straight-line per-connection handler + `Config`/handler API |
 | `src/server.zig` | `Server`: `std.Io.net` listen + accept loop + fiber-per-connection |
 
 Removed by the migration: `src/socket.zig`, `src/poller.zig`.
 
-## TLS (Phase 2 — separate spec)
+## TLS
 
-Not in this phase. Phase 2 introduces a transport seam over the `Stream` (a plain
-passthrough plus a TLS 1.3 record layer built on `std.crypto` primitives) so the
-connection loop is agnostic to whether bytes are encrypted.
+`Config.tls` enables a server-only TLS transport before the HTTP connection loop.
+It supports TLS 1.2 ECDHE and TLS 1.3 with AEAD suites by default, then exposes
+the same read/write seam used by plaintext HTTP and WebSocket connections.
+Handshake time shares the request deadline; application reads and writes retain
+their existing deadlines.
+
+ALPN is restricted to `http/1.1`; HTTP/2 is intentionally unsupported. Session
+resumption, early data, TLS client mode, and mTLS are out of scope. The TLS
+implementation is derived from `ianic/tls.zig` under MIT and uses Zig
+`std.crypto`; its license is retained in `src/tls/LICENSE`.
 
 ## Build & test
 

@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const http = @import("http.zig");
+const tls = @import("tls/root.zig");
 const websocket = @import("websocket.zig");
 
 const Allocator = std.mem.Allocator;
@@ -14,6 +15,11 @@ pub const Action = union(enum) {
     respond,
     stream: StreamHandler,
     upgrade,
+};
+
+pub const TlsConfig = struct {
+    auth: *tls.CertKeyPair,
+    cipher_suites: []const tls.CipherSuite = tls.cipher_suites.secure,
 };
 
 pub const Config = struct {
@@ -31,6 +37,7 @@ pub const Config = struct {
     keep_alive_timeout: ?std.Io.Duration = .fromSeconds(60),
     /// Maximum time allowed to flush one HTTP response or WebSocket frame.
     write_timeout: ?std.Io.Duration = .fromSeconds(30),
+    tls: ?TlsConfig = null,
 
     on_request: *const fn (*const http.Request, *http.Response, ?*anyopaque) Action,
     on_ws_open: ?*const fn (*Connection, ?*anyopaque) void = null,
@@ -54,6 +61,7 @@ pub const Connection = struct {
     closing: bool = false,
     close_notified: bool = false,
     stream_framing: enum { none, chunked, close_delimited } = .none,
+    tls_connection: ?*tls.Connection = null,
 
     fn init(io: std.Io, stream: Stream, gpa: Allocator, cfg: *const Config) !Connection {
         if (cfg.read_buffer_size < 4) return error.InvalidConfiguration;
@@ -126,8 +134,7 @@ pub const Connection = struct {
             try callback(&self.req, self, self.cfg.user_data);
             if (chunked)
                 try timedWrite(
-                    self.io,
-                    self.stream,
+                    self,
                     "0\r\n\r\n",
                     durationTimeout(self.cfg.write_timeout),
                 );
@@ -333,8 +340,7 @@ pub const Connection = struct {
         const end = @min(limit, self.read_buf.len);
         std.debug.assert(self.read_len < end);
         const n = try timedRead(
-            self.io,
-            self.stream.socket.handle,
+            self,
             self.read_buf[self.read_len..end],
             timeout,
         );
@@ -371,8 +377,7 @@ pub const Connection = struct {
     fn flush(self: *Connection) !void {
         if (self.write_buf.items.len == 0) return;
         try timedWrite(
-            self.io,
-            self.stream,
+            self,
             self.write_buf.items,
             durationTimeout(self.cfg.write_timeout),
         );
@@ -409,8 +414,7 @@ pub const Connection = struct {
             .none => return error.NotStreaming,
             .close_delimited => if (data.len > 0)
                 try timedWrite(
-                    self.io,
-                    self.stream,
+                    self,
                     data,
                     durationTimeout(self.cfg.write_timeout),
                 ),
@@ -419,9 +423,9 @@ pub const Connection = struct {
                 var buffer: [2 * @sizeOf(usize) + 2]u8 = undefined;
                 const head = std.fmt.bufPrint(&buffer, "{x}\r\n", .{data.len}) catch unreachable;
                 const timeout = durationTimeout(self.cfg.write_timeout);
-                try timedWrite(self.io, self.stream, head, timeout);
-                try timedWrite(self.io, self.stream, data, timeout);
-                try timedWrite(self.io, self.stream, "\r\n", timeout);
+                try timedWrite(self, head, timeout);
+                try timedWrite(self, data, timeout);
+                try timedWrite(self, "\r\n", timeout);
             },
         }
     }
@@ -465,15 +469,90 @@ const ReadRace = union(enum) {
 };
 
 fn timedRead(
-    io: std.Io,
-    socket_handle: std.Io.net.Socket.Handle,
+    connection: *Connection,
     buffer: []u8,
     timeout: std.Io.Timeout,
 ) !usize {
-    if (timeout == .none) return rawRead(io, socket_handle, buffer);
+    if (timeout == .none) return transportRead(connection, buffer);
     var results: [2]ReadRace = undefined;
-    var select = std.Io.Select(ReadRace).init(io, &results);
-    select.async(.io, rawRead, .{ io, socket_handle, buffer });
+    var select = std.Io.Select(ReadRace).init(connection.io, &results);
+    select.async(.io, transportRead, .{ connection, buffer });
+    select.async(.timeout, waitTimeout, .{ connection.io, timeout });
+    defer select.cancelDiscard();
+    return switch (try select.await()) {
+        .io => |result| try result,
+        .timeout => |result| {
+            try result;
+            return error.Timeout;
+        },
+    };
+}
+
+fn transportRead(connection: *Connection, buffer: []u8) !usize {
+    if (connection.tls_connection) |tls_connection|
+        return tls_connection.read(buffer);
+    var buffers = [1][]u8{buffer};
+    return connection.io.vtable.netRead(
+        connection.io.userdata,
+        connection.stream.socket.handle,
+        &buffers,
+    );
+}
+
+const WriteRace = union(enum) {
+    io: anyerror!void,
+    timeout: std.Io.Cancelable!void,
+};
+
+fn timedWrite(
+    connection: *Connection,
+    bytes: []const u8,
+    timeout: std.Io.Timeout,
+) !void {
+    if (timeout == .none) return transportWrite(connection, bytes);
+    var results: [2]WriteRace = undefined;
+    var select = std.Io.Select(WriteRace).init(connection.io, &results);
+    select.async(.io, transportWrite, .{ connection, bytes });
+    select.async(.timeout, waitTimeout, .{ connection.io, timeout });
+    defer select.cancelDiscard();
+    switch (try select.await()) {
+        .io => |result| try result,
+        .timeout => |result| {
+            try result;
+            return error.Timeout;
+        },
+    }
+}
+
+fn transportWrite(connection: *Connection, bytes: []const u8) !void {
+    if (connection.tls_connection) |tls_connection|
+        return tls_connection.writeAll(bytes);
+    var buffer: [1024]u8 = undefined;
+    var writer = connection.stream.writer(connection.io, &buffer);
+    try writer.interface.writeAll(bytes);
+    try writer.interface.flush();
+}
+
+fn waitTimeout(io: std.Io, timeout: std.Io.Timeout) std.Io.Cancelable!void {
+    try timeout.sleep(io);
+}
+
+const TlsHandshakeRace = union(enum) {
+    io: anyerror!tls.Connection,
+    timeout: std.Io.Cancelable!void,
+};
+
+fn tlsServerWithTimeout(
+    io: std.Io,
+    input: *std.Io.Reader,
+    output: *std.Io.Writer,
+    options: tls.ServerOptions,
+    timeout: std.Io.Timeout,
+) !tls.Connection {
+    if (timeout == .none) return tls.server(input, output, options);
+    var results: [2]TlsHandshakeRace = undefined;
+    var select = std.Io.Select(TlsHandshakeRace).init(io, &results);
+    select.async(.io, tls.server, .{ input, output, options });
     select.async(.timeout, waitTimeout, .{ io, timeout });
     defer select.cancelDiscard();
     return switch (try select.await()) {
@@ -485,52 +564,34 @@ fn timedRead(
     };
 }
 
-fn rawRead(io: std.Io, socket_handle: std.Io.net.Socket.Handle, buffer: []u8) !usize {
-    var buffers = [1][]u8{buffer};
-    return io.vtable.netRead(io.userdata, socket_handle, &buffers);
-}
-
-const WriteRace = union(enum) {
-    io: anyerror!void,
-    timeout: std.Io.Cancelable!void,
-};
-
-fn timedWrite(
-    io: std.Io,
-    stream: Stream,
-    bytes: []const u8,
-    timeout: std.Io.Timeout,
-) !void {
-    if (timeout == .none) return rawWrite(io, stream, bytes);
-    var results: [2]WriteRace = undefined;
-    var select = std.Io.Select(WriteRace).init(io, &results);
-    select.async(.io, rawWrite, .{ io, stream, bytes });
-    select.async(.timeout, waitTimeout, .{ io, timeout });
-    defer select.cancelDiscard();
-    switch (try select.await()) {
-        .io => |result| try result,
-        .timeout => |result| {
-            try result;
-            return error.Timeout;
-        },
-    }
-}
-
-fn rawWrite(io: std.Io, stream: Stream, bytes: []const u8) !void {
-    var buffer: [1024]u8 = undefined;
-    var writer = stream.writer(io, &buffer);
-    try writer.interface.writeAll(bytes);
-    try writer.interface.flush();
-}
-
-fn waitTimeout(io: std.Io, timeout: std.Io.Timeout) std.Io.Cancelable!void {
-    try timeout.sleep(io);
-}
-
 pub fn handle(io: std.Io, stream: Stream, gpa: Allocator, cfg: *const Config) !void {
     defer stream.close(io);
     var connection = try Connection.init(io, stream, gpa, cfg);
     defer connection.deinit();
+
+    if (cfg.tls) |tls_config| {
+        var input_buffer: [tls.input_buffer_len]u8 = undefined;
+        var output_buffer: [tls.output_buffer_len]u8 = undefined;
+        var input = stream.reader(io, &input_buffer);
+        var output = stream.writer(io, &output_buffer);
+        const rng_source: std.Random.IoSource = .{ .io = io };
+        var tls_connection = try tlsServerWithTimeout(
+            io,
+            &input.interface,
+            &output.interface,
+            .{
+                .rng = rng_source.interface(),
+                .auth = tls_config.auth,
+                .cipher_suites = tls_config.cipher_suites,
+                .alpn_protocols = &.{"http/1.1"},
+                .now = std.Io.Clock.real.now(io),
+            },
+            durationTimeout(cfg.request_timeout),
+        );
+        connection.tls_connection = &tls_connection;
+        defer tls_connection.close() catch {};
+        return connection.run();
+    }
     try connection.run();
 }
 
@@ -611,6 +672,93 @@ fn tcpPair(io: std.Io) ![2]Stream {
     const client = try peer_address.connect(io, .{ .mode = .stream });
     errdefer client.close(io);
     return .{ client, try listener.accept(io) };
+}
+
+test "TLS 1.2 and 1.3 serve HTTP through the same connection path" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    var threaded = std.Io.Threaded.init(testing.allocator, .{ .async_limit = .unlimited });
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var auth = try tls.CertKeyPair.fromSlice(
+        testing.allocator,
+        io,
+        @embedFile("tls/testdata/server_cert.pem"),
+        @embedFile("tls/testdata/server_key.pem"),
+    );
+    defer auth.deinit(testing.allocator);
+
+    const cases = [_][]const tls.CipherSuite{
+        &.{.ECDHE_RSA_WITH_AES_128_GCM_SHA256},
+        &.{.AES_128_GCM_SHA256},
+    };
+    for (cases) |cipher_suites| {
+        const streams = try tcpPair(io);
+        const client_stream = streams[0];
+        defer client_stream.close(io);
+        const server_stream = streams[1];
+        var cfg: Config = .{
+            .on_request = helloHandler,
+            .tls = .{
+                .auth = &auth,
+                .cipher_suites = cipher_suites,
+            },
+        };
+        var server_future = io.async(handle, .{
+            io,
+            server_stream,
+            testing.allocator,
+            &cfg,
+        });
+        defer server_future.cancel(io) catch {};
+
+        const Client = std.crypto.tls.Client;
+        var input_buffer: [Client.min_buffer_len]u8 = undefined;
+        var output_buffer: [Client.min_buffer_len]u8 = undefined;
+        var tls_read_buffer: [Client.min_buffer_len]u8 = undefined;
+        var tls_write_buffer: [Client.min_buffer_len]u8 = undefined;
+        var input = client_stream.reader(io, &input_buffer);
+        var output = client_stream.writer(io, &output_buffer);
+        var entropy: [Client.Options.entropy_len]u8 = undefined;
+        io.random(&entropy);
+        var client = try Client.init(&input.interface, &output.interface, .{
+            .host = .no_verification,
+            .ca = .no_verification,
+            .read_buffer = &tls_read_buffer,
+            .write_buffer = &tls_write_buffer,
+            .entropy = &entropy,
+            .realtime_now = std.Io.Clock.real.now(io),
+        });
+        try client.writer.writeAll(
+            "GET /secure HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        );
+        try client.writer.flush();
+        try output.interface.flush();
+
+        var response: [512]u8 = undefined;
+        const n = try client.reader.readSliceShort(&response);
+        server_future.await(io) catch |server_err| {
+            std.debug.print("TLS HTTP server error: {s}\n", .{@errorName(server_err)});
+            return server_err;
+        };
+        try testing.expect(std.mem.startsWith(u8, response[0..n], "HTTP/1.1 200 OK\r\n"));
+        try testing.expect(std.mem.indexOf(u8, response[0..n], "path=/secure") != null);
+    }
+
+    const streams = try tcpPair(io);
+    defer streams[0].close(io);
+    var timeout_cfg: Config = .{
+        .request_timeout = .fromMilliseconds(20),
+        .on_request = helloHandler,
+        .tls = .{ .auth = &auth },
+    };
+    var timeout_future = io.async(handle, .{
+        io,
+        streams[1],
+        testing.allocator,
+        &timeout_cfg,
+    });
+    try testing.expectError(error.Timeout, timeout_future.await(io));
 }
 
 test "HTTP keep-alive and parse error over std.Io.net" {

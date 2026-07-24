@@ -12,8 +12,10 @@ spirit of [civetweb](https://github.com/civetweb/civetweb).
   `libSystem` (Evented → Dispatch/GCD; Apple provides no stable syscall ABI).
 - **Low memory**: bounded per-connection buffers, zero-copy `Content-Length`
   bodies. Each connection carries a (lazily-committed) fiber stack.
+- **TLS 1.2 + 1.3 server support**, with ALPN restricted to `http/1.1`.
 - **Heavily unit-tested**: parser, chunked decoding, WebSocket codec (incl. the
-  RFC 6455 accept vector), and end-to-end HTTP + WebSocket over real TCP.
+  RFC 6455 accept vector), and end-to-end HTTP, WebSocket, TLS 1.2, and TLS 1.3
+  over real TCP.
 
 > **Status:** the networking layer now uses `std.Io.net`; the previous
 > socket/poller/reactor has been removed. Zig 0.16.0's Evented network vtable is
@@ -94,9 +96,19 @@ pub fn main() !void {
     defer threaded.deinit();
     const io = threaded.io();
 
+    var auth = try linsang.tls.CertKeyPair.fromFilePath(
+        gpa,
+        io,
+        std.Io.Dir.cwd(),
+        "cert.pem",
+        "key.pem",
+    );
+    defer auth.deinit(gpa);
+
     var server = linsang.Server.init(gpa, .{
         .address = "0.0.0.0",
-        .port = 8080,
+        .port = 8443,
+        .tls = .{ .auth = &auth }, // omit for plaintext
         .on_request = onRequest,
         .on_ws_message = onMessage, // optional
     });
@@ -104,11 +116,12 @@ pub fn main() !void {
 }
 ```
 
-`Config` knobs: `read_buffer_size`, `max_body_size`, `max_ws_message_size`,
+`Config` knobs: `tls`, `read_buffer_size`, `max_body_size`, `max_ws_message_size`,
 `request_timeout`, `keep_alive_timeout`, `write_timeout`, `backlog`, `max_connections`,
 `user_data`, and the `on_ws_open`/`on_ws_close` hooks. Set a timeout to `null`
 to disable it. `max_connections` defaults to 128; excess accepted connections
-receive 503 and are closed so Threaded cannot grow its worker pool without bound.
+receive 503 on plaintext listeners, or are closed before TLS negotiation, so
+Threaded cannot grow its worker pool without bound.
 
 For managed lifetimes, `server.start(io)` returns a `Running` handle.
 `running.stop()` stops accepting, cancels active connections, and waits for
@@ -125,8 +138,8 @@ a fiber; under Threaded it uses the runtime's thread pool.
 
 **In:** HTTP/1.1 keep-alive, buffered and streaming responses, `Content-Length`
 + chunked bodies (both directions), WebSocket handshake + framing +
-fragmentation + ping/pong/close.
+fragmentation + ping/pong/close, and TLS 1.2/1.3 server transport.
 
-**Out (by design):** HTTP/2, pipelining, compression, multipart. **TLS is a
-planned Phase 2** (TLS 1.3 over a transport seam on `Stream`, built on
-`std.crypto` primitives) — not in this release.
+**Out (by design):** HTTP/2, pipelining, compression, multipart, TLS client
+mode, TLS session resumption, and mTLS. TLS advertises only `http/1.1` through
+ALPN.

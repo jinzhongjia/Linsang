@@ -9,10 +9,12 @@ pub const version = "0.1.0-dev";
 
 pub const http = @import("http.zig");
 pub const websocket = @import("websocket.zig");
+pub const tls = @import("tls/root.zig");
 pub const connection = @import("connection.zig");
 pub const server = @import("server.zig");
 
 pub const Config = connection.Config;
+pub const TlsConfig = connection.TlsConfig;
 pub const Connection = connection.Connection;
 pub const Action = connection.Action;
 pub const StreamHandler = connection.StreamHandler;
@@ -28,6 +30,7 @@ pub const Status = http.Status;
 test {
     _ = http;
     _ = websocket;
+    _ = tls;
     _ = connection;
     _ = server;
 }

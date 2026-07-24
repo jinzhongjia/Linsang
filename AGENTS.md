@@ -6,7 +6,7 @@ design; this file is the working brief.
 ## What this is
 
 A small embeddable **HTTP/1.1 + WebSocket** server library in **Zig 0.16**, in the
-spirit of civetweb. Plaintext phase. TLS 1.3 is Phase 2 (not started).
+spirit of civetweb. Optional server TLS supports TLS 1.2 and TLS 1.3.
 
 ## Status: `std.Io.net` migration landed (read this first)
 
@@ -81,6 +81,7 @@ Module map (target, all under `src/`):
 | `main.zig` | demo: build a Threaded `io`, run the server |
 | `http.zig` | `Method`/`Status`/`Request`/`Response` + parser + chunked decoder |
 | `websocket.zig` | RFC 6455 handshake + frame codec + `Assembler` |
+| `tls/` | TLS 1.2/1.3 server transport, derived from `ianic/tls.zig` (MIT) |
 | `connection.zig` | straight-line per-connection handler + `Config`/handler API |
 | `server.zig` | `std.Io.net` listen + accept loop + fiber-per-connection |
 
@@ -125,9 +126,10 @@ event coalescing. `std.Io.net` handles all of this now.
 ## Scope
 
 **In**: keep-alive, buffered + streaming responses, `Content-Length` + chunked
-(both directions), WebSocket handshake/framing/fragmentation/ping-pong-close.
-**Out**: HTTP/2, pipelining, compression, multipart.
-**Phase 2**: TLS 1.3 over a transport seam on `Stream`, built on `std.crypto`.
+(both directions), WebSocket handshake/framing/fragmentation/ping-pong-close,
+TLS 1.2/1.3 server transport.
+**Out**: HTTP/2, pipelining, compression, multipart, TLS client mode, session
+resumption, early data, mTLS.
 
 ## Guardrails
 
