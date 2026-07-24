@@ -4,18 +4,16 @@ A small, embeddable HTTP/1.1 + WebSocket server library in Zig 0.16, in the
 spirit of civetweb. No `std.http`, no third-party deps, no libc where the OS
 permits it, low memory, heavy unit tests.
 
-## Status: migration in progress
+## Status: `std.Io.net` migration landed
 
-The design below is the **target** architecture: networking on **`std.Io.net`**
-driven by the **`std.Io` runtime** (Evented / io_uring), one **fiber per
-connection**.
+Networking now uses **`std.Io.net`** and accepts a **`std.Io` runtime**.
+The hand-rolled `socket.zig`, `poller.zig`, and reactor have been removed;
+`http.zig` and `websocket.zig` remain pure protocol code.
 
-The current source tree still contains the **previous** implementation — a
-hand-rolled per-OS socket layer (`socket.zig`), readiness poller (`poller.zig`),
-and a per-thread epoll/kqueue/WSAPoll reactor. That is being **replaced**:
-`socket.zig` and `poller.zig` go away, and `connection.zig`/`server.zig` are
-rewritten around `std.Io.net`. `http.zig` and `websocket.zig` (pure protocol
-code) are kept as-is.
+Zig 0.16.0's Evented implementations currently expose unavailable network
+vtable entries, so the runnable demo and tests use `std.Io.Threaded`.
+`std.Io.Evented` remains the fiber-per-connection target once stdlib networking
+support lands; no temporary socket backend is kept in this library.
 
 Why the change: `std.Io.net` is stdlib-tested on all three platforms, which
 removes the hand-rolled Winsock/kqueue backends we could not run-verify here, and
@@ -38,12 +36,12 @@ of a state machine. Trade-off accepted below (fiber stacks, Windows fallback).
     forces `libSystem` regardless (Apple gives no stable syscall ABI), so this is
     unavoidable, not a choice.
 
-## Concurrency: fiber per connection on the std.Io runtime
+## Concurrency target: fiber per connection on the std.Io runtime
 
 The library accepts an `io: std.Io` and threads it through. Callers choose the
 implementation:
 
-- **`std.Io.Evented`** (recommended) — an event-loop runtime that multiplexes
+- **`std.Io.Evented`** (target once networking is implemented) — an event-loop runtime that multiplexes
   fibers over the OS's async facility. Per-OS mapping in 0.16:
   - Linux → **io_uring** (`Uring`)
   - *BSD → `Kqueue`
@@ -145,6 +143,6 @@ connection loop is agnostic to whether bytes are encrypted.
 
 ## Build & test
 
-Linux is runtime-tested here (`zig build test`). macOS (Dispatch) and Windows
-(Threaded) are cross-compile-checked (`zig build -Dtarget=…`) but not
-runtime-verified in this environment. `zig build test` runs the whole suite.
+Linux is runtime-tested here with Threaded (`zig build test`). macOS and Windows
+are cross-compile-checked (`zig build -Dtarget=…`) but not runtime-verified in
+this environment. `zig build test` runs the whole suite.

@@ -8,17 +8,19 @@ design; this file is the working brief.
 A small embeddable **HTTP/1.1 + WebSocket** server library in **Zig 0.16**, in the
 spirit of civetweb. Plaintext phase. TLS 1.3 is Phase 2 (not started).
 
-## Status: migration in progress (read this first)
+## Status: `std.Io.net` migration landed (read this first)
 
-We are moving the networking layer to **`std.Io.net`** driven by the **`std.Io`
-runtime** (Evented / io_uring), **one fiber per connection**.
+The networking layer now uses **`std.Io.net`** driven by the **`std.Io`
+runtime**.
 
 - **Keep**: `http.zig`, `websocket.zig` (pure protocol code — reused verbatim).
-- **Replace / remove**: `socket.zig` and `poller.zig` (hand-rolled per-OS sockets +
-  readiness poller) go away. `connection.zig` and `server.zig` are rewritten around
-  `std.Io.net` (straight-line fiber handler instead of a reactor state machine).
-- The current tree still has the old hand-rolled version until the rewrite lands.
-  When editing, target the new design; don't invest further in `socket.zig`/`poller.zig`.
+- **Removed**: `socket.zig` and `poller.zig` (hand-rolled per-OS sockets +
+  readiness poller).
+- `connection.zig` and `server.zig` use straight-line handlers and
+  `std.Io.Group`, with no reactor state machine.
+- Zig 0.16.0's Evented network vtable is not implemented yet, so the runnable
+  demo and tests currently use `std.Io.Threaded`. Evented remains the target
+  once stdlib support lands.
 
 ## Hard constraints (do not violate)
 
@@ -52,7 +54,7 @@ Cross-compile matrix that must keep compiling:
 
 The library takes an `io: std.Io` and threads it through. Callers pick the runtime:
 
-- **`std.Io.Evented`** (recommended): Linux → **io_uring**, *BSD → kqueue,
+- **`std.Io.Evented`** (target once networking is implemented): Linux → **io_uring**, *BSD → kqueue,
   macOS → **Dispatch/GCD**, **Windows → not available (`void`)**.
 - **`std.Io.Threaded`**: thread-pool blocking; the **required Windows fallback**.
 
@@ -109,8 +111,8 @@ event coalescing. `std.Io.net` handles all of this now.
   `src/foo.zig` → add `pub const foo = @import("foo.zig");` and `_ = foo;`.
 - **`// ponytail:` comments** mark deliberate simplifications with their upgrade
   path. Respect them.
-- **Platform status**: Linux is runtime-tested. macOS (Dispatch) and Windows
-  (Threaded) are cross-compile-verified only. Linux-only tests guard with
+- **Platform status**: Linux is runtime-tested with Threaded. macOS and Windows
+  are cross-compile-verified only. Linux-only tests guard with
   `if (builtin.os.tag != .linux) return error.SkipZigTest`.
 
 ## Scope

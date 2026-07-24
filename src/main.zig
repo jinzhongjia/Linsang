@@ -27,13 +27,17 @@ fn onWsMessage(conn: *linsang.Connection, msg: ws.Message, ud: ?*anyopaque) void
 
 pub fn main() !void {
     const gpa = std.heap.page_allocator;
+    // ponytail: std.Io.Evented 0.16 has no net vtable yet; switch runtimes when
+    // the stdlib implementation lands.
+    var threaded = std.Io.Threaded.init(gpa, .{ .async_limit = .unlimited });
+    defer threaded.deinit();
+
     var server = linsang.Server.init(gpa, .{
         .address = "0.0.0.0",
         .port = 8080,
         .on_request = onRequest,
         .on_ws_message = onWsMessage,
     });
-    try server.start();
     std.log.info("Linsang {s} listening on http://0.0.0.0:8080  (WebSocket echo at /ws)", .{linsang.version});
-    server.wait();
+    try server.run(threaded.io());
 }

@@ -4,8 +4,8 @@ A small, embeddable **HTTP/1.1 + WebSocket** server library in Zig 0.16, in the
 spirit of [civetweb](https://github.com/civetweb/civetweb).
 
 - **No `std.http`** — the HTTP + WebSocket protocol code is our own.
-- Networking uses **`std.Io.net`** on the **`std.Io` runtime** (one fiber per
-  connection), so we don't hand-roll per-OS socket code.
+- Networking uses **`std.Io.net`** on the **`std.Io` runtime** (one task per
+  connection; a fiber under Evented), so we don't hand-roll per-OS socket code.
 - **No third-party dependencies.**
 - **No libc** where the OS allows: Linux (Evented → io_uring) and Windows
   (Threaded → `kernel32`/`ws2_32`, not the C runtime). macOS necessarily links
@@ -15,16 +15,17 @@ spirit of [civetweb](https://github.com/civetweb/civetweb).
 - **Heavily unit-tested**: parser, chunked decoding, WebSocket codec (incl. the
   RFC 6455 accept vector), and end-to-end HTTP + WebSocket over real TCP.
 
-> **Status:** migrating the networking layer to `std.Io.net` + `std.Io.Evented`.
-> `http.zig` and `websocket.zig` (protocol code) are stable; `connection.zig` and
-> `server.zig` are being rewritten around `std.Io.net` (the previous hand-rolled
-> socket/poller/reactor is being removed). See [docs/DESIGN.md](docs/DESIGN.md).
+> **Status:** the networking layer now uses `std.Io.net`; the previous
+> socket/poller/reactor has been removed. Zig 0.16.0's Evented network vtable is
+> not implemented yet, so the runnable demo and tests currently use
+> `std.Io.Threaded`.
 
 ## Concurrency runtime
 
 The library takes an `io: std.Io` and threads it through. Callers choose:
 
-- **`std.Io.Evented`** (recommended) — fiber-based event loop:
+- **`std.Io.Evented`** (target once its network vtable is implemented) —
+  fiber-based event loop:
   Linux → **io_uring**, \*BSD → kqueue, macOS → **Dispatch/GCD**,
   **Windows → not available**.
 - **`std.Io.Threaded`** — thread-pool blocking; the **required fallback on Windows**.
@@ -37,8 +38,8 @@ many connections share a small thread pool. Fibers are supported on `x86_64`,
 
 | OS | Runtime | Status |
 |----|---------|--------|
-| Linux | `std.Io.Evented` → io_uring (no libc) | runtime-tested |
-| macOS | `std.Io.Evented` → Dispatch/GCD (libSystem) | cross-compile-verified |
+| Linux | `std.Io.Threaded` currently; Evented target | runtime-tested |
+| macOS | `std.Io.Threaded` currently; Evented target | cross-compile-verified |
 | Windows | `std.Io.Threaded` (`ws2_32`, no CRT) | cross-compile-verified |
 
 `x86_64` and `aarch64` both cross-compile. macOS/Windows are compiled and
@@ -54,8 +55,7 @@ zig build         # build the demo binary into zig-out/bin/linsang
 
 ## Use as a library
 
-The API threads a `std.Io` instance through the server (final shape lands with
-the migration):
+The API threads a `std.Io` instance through the server:
 
 ```zig
 const std = @import("std");
@@ -78,10 +78,9 @@ fn onMessage(conn: *linsang.Connection, msg: linsang.websocket.Message, ud: ?*an
 pub fn main() !void {
     const gpa = std.heap.page_allocator;
 
-    var evented: std.Io.Evented = undefined;
-    try evented.init(gpa, .{}); // Threaded on Windows
-    defer evented.deinit();
-    const io = evented.io();
+    var threaded = std.Io.Threaded.init(gpa, .{ .async_limit = .unlimited });
+    defer threaded.deinit();
+    const io = threaded.io();
 
     var server = linsang.Server.init(gpa, .{
         .address = "0.0.0.0",
@@ -89,7 +88,7 @@ pub fn main() !void {
         .on_request = onRequest,
         .on_ws_message = onMessage, // optional
     });
-    try server.run(io); // accept loop + one fiber per connection
+    try server.run(io); // accept loop + one std.Io task per connection
 }
 ```
 
@@ -99,9 +98,9 @@ pub fn main() !void {
 ## Design
 
 See [docs/DESIGN.md](docs/DESIGN.md). In short: `IpAddress.listen(io)` → accept
-loop → one fiber per connection via `std.Io.Group`. A connection lives entirely
-inside its fiber, so there are no locks on the hot path. Handlers run in the fiber
-and may block on `io` operations, but must not make foreign OS-blocking calls.
+loop → one task per connection via `std.Io.Group`. A connection lives entirely
+inside its task, so there are no locks on the hot path. Under Evented the task is
+a fiber; under Threaded it uses the runtime's thread pool.
 
 ## Scope
 
