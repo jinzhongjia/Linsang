@@ -52,6 +52,45 @@ pub const CertKeyPair = struct {
     /// signatures with the same key to not repeat that operation.
     ecdsa_key_pair: ?EcdsaKeyPair = null,
 
+    fn init(
+        io: Io,
+        bundle: Certificate.Bundle,
+        key: PrivateKey,
+    ) !CertKeyPair {
+        var pair: CertKeyPair = .{
+            .bundle = bundle,
+            .key = key,
+            .ecdsa_key_pair = try EcdsaKeyPair.init(key),
+        };
+        try pair.validateKeyPair(io);
+        return pair;
+    }
+
+    fn validateKeyPair(c: *CertKeyPair, io: Io) !void {
+        if (c.bundle.bytes.items.len == 0) return error.CertificateKeyMismatch;
+        const leaf = (Certificate{
+            .buffer = c.bundle.bytes.items,
+            .index = 0,
+        }).parse() catch return error.CertificateKeyMismatch;
+
+        const challenge = "Linsang certificate/private-key match";
+        var signature_buffer: [512]u8 = undefined;
+        const rng_source: std.Random.IoSource = .{ .io = io };
+        const signed = c.signMessage(
+            challenge,
+            rng_source.interface(),
+            &signature_buffer,
+        ) catch return error.CertificateKeyMismatch;
+
+        var verifier: CertificateParser = undefined;
+        verifier.pub_key_algo = leaf.pub_key_algo;
+        verifier.pub_key = leaf.pubKey();
+        verifier.signature_scheme = signed.scheme;
+        verifier.signature = signed.bytes;
+        verifier.verifySignature(challenge) catch
+            return error.CertificateKeyMismatch;
+    }
+
     pub fn fromFilePath(
         allocator: mem.Allocator,
         io: Io,
@@ -59,14 +98,14 @@ pub const CertKeyPair = struct {
         cert_path: []const u8,
         key_path: []const u8,
     ) !CertKeyPair {
-        const bundle = try cert.fromFilePath(allocator, io, dir, cert_path);
+        var bundle = try cert.fromFilePath(allocator, io, dir, cert_path);
+        errdefer bundle.deinit(allocator);
         const key_file = try dir.openFile(io, key_path, .{});
         defer key_file.close(io);
         var rdr = key_file.reader(io, &.{});
 
         const key = try PrivateKey.fromFile(allocator, &rdr.interface);
-
-        return .{ .bundle = bundle, .key = key, .ecdsa_key_pair = try EcdsaKeyPair.init(key) };
+        return init(io, bundle, key);
     }
 
     pub fn fromFilePathAbsolute(
@@ -75,14 +114,14 @@ pub const CertKeyPair = struct {
         cert_path: []const u8,
         key_path: []const u8,
     ) !CertKeyPair {
-        const bundle = try cert.fromFilePathAbsolute(allocator, io, cert_path);
+        var bundle = try cert.fromFilePathAbsolute(allocator, io, cert_path);
+        errdefer bundle.deinit(allocator);
         const key_file = try std.Io.Dir.openFileAbsolute(io, key_path, .{});
         defer key_file.close(io);
         var rdr = key_file.reader(io, &.{});
 
         const key = try PrivateKey.fromFile(allocator, &rdr.interface);
-
-        return .{ .bundle = bundle, .key = key, .ecdsa_key_pair = try EcdsaKeyPair.init(key) };
+        return init(io, bundle, key);
     }
 
     pub fn fromSlice(
@@ -92,9 +131,9 @@ pub const CertKeyPair = struct {
         key_slice: []const u8,
     ) !CertKeyPair {
         const key = try PrivateKey.parsePem(key_slice);
-        const bundle = try cert.fromSlice(allocator, io, cert_slice);
-
-        return .{ .bundle = bundle, .key = key, .ecdsa_key_pair = try EcdsaKeyPair.init(key) };
+        var bundle = try cert.fromSlice(allocator, io, cert_slice);
+        errdefer bundle.deinit(allocator);
+        return init(io, bundle, key);
     }
 
     pub fn deinit(c: *CertKeyPair, allocator: mem.Allocator) void {
@@ -621,6 +660,27 @@ test "DhKeyPair.x25519" {
     );
     var kp = try DhKeyPair.init(seed, &.{.x25519});
     try testing.expectEqualSlices(u8, expected, try kp.sharedKey(.x25519, server_pub_key));
+}
+
+test "CertKeyPair rejects a private key that does not match its leaf certificate" {
+    const certificate = @embedFile("testdata/server_cert.pem");
+    var matching = try CertKeyPair.fromSlice(
+        testing.allocator,
+        testing.io,
+        certificate,
+        @embedFile("testdata/server_key.pem"),
+    );
+    defer matching.deinit(testing.allocator);
+
+    try testing.expectError(
+        error.CertificateKeyMismatch,
+        CertKeyPair.fromSlice(
+            testing.allocator,
+            testing.io,
+            certificate,
+            @embedFile("testdata/rsa_private_key.pem"),
+        ),
+    );
 }
 
 test "CertificateBuilder.makeCertificateVerify ed25519" {

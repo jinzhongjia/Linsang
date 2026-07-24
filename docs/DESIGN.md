@@ -164,6 +164,9 @@ the same read/write seam used by plaintext HTTP and WebSocket connections.
 Handshake time shares the request deadline; application reads and writes retain
 their existing deadlines.
 
+Certificate configuration is validated at load time by signing a challenge with
+the private key and verifying it against the leaf certificate.
+
 ALPN is restricted to `http/1.1`; HTTP/2 is intentionally unsupported. Session
 resumption, early data, TLS client mode, and mTLS are out of scope. The TLS
 implementation is derived from `ianic/tls.zig` under MIT and uses Zig
@@ -173,4 +176,6 @@ implementation is derived from `ianic/tls.zig` under MIT and uses Zig
 
 Linux is runtime-tested here with Threaded (`zig build test`). macOS and Windows
 are cross-compile-checked (`zig build -Dtarget=…`) but not runtime-verified in
-this environment. `zig build test` runs the whole suite.
+this environment. `zig build fuzz --fuzz=100K` covers the HTTP, static-file,
+WebSocket, and TLS parsers. `zig build interop` checks RSA and ECDSA certificates
+with curl and OpenSSL over TLS 1.2 and TLS 1.3.

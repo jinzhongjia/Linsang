@@ -93,6 +93,7 @@ pub const Handshake = struct {
     transcript: Transcript = .{},
     /// ALPN protocol selected during handshake.
     alpn_protocol: ?[]const u8 = null,
+    secure_renegotiation: bool = false,
 
     const Self = @This();
 
@@ -529,9 +530,15 @@ pub const Handshake = struct {
         try w.int(u8, 0); // session resumption is intentionally unsupported
         try w.enumValue(h.cipher_suite);
         try w.int(u8, 0); // null compression
-        if (h.alpn_protocol) |selected| {
+        if (h.secure_renegotiation or h.alpn_protocol != null) {
             const ext_len_pos = try w.skip(2);
-            try w.alpn(&.{selected});
+            if (h.secure_renegotiation) {
+                try w.enumValue(proto.Extension.renegotiation_info);
+                try w.int(u16, 1);
+                try w.int(u8, 0);
+            }
+            if (h.alpn_protocol) |selected|
+                try w.alpn(&.{selected});
             var ew = w.writerAt(ext_len_pos);
             try ew.int(u16, w.pos() - ext_len_pos - 2);
         }
@@ -574,6 +581,11 @@ pub const Handshake = struct {
         const offered_ciphers = try d.slice(try d.decode(u16));
         if (offered_ciphers.len == 0 or offered_ciphers.len % 2 != 0)
             return error.TlsDecodeError;
+        var cipher_idx: usize = 0;
+        while (cipher_idx < offered_ciphers.len) : (cipher_idx += 2) {
+            if (std.mem.readInt(u16, offered_ciphers[cipher_idx..][0..2], .big) == 0x00ff)
+                h.secure_renegotiation = true;
+        }
         const compression_methods = try d.slice(try d.decode(u8));
         if (std.mem.indexOfScalar(u8, compression_methods, 0) == null)
             return error.TlsIllegalParameter;
@@ -703,6 +715,11 @@ pub const Handshake = struct {
                     } else {
                         try d.skip(extension_end - d.idx);
                     }
+                },
+                .renegotiation_info => {
+                    if (extension_len != 1 or try d.decode(u8) != 0)
+                        return error.TlsIllegalParameter;
+                    h.secure_renegotiation = true;
                 },
                 else => {
                     try d.skip(extension_end - d.idx);

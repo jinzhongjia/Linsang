@@ -1092,6 +1092,48 @@ test "static path, range, ETag, and content type helpers" {
     try testing.expectEqualStrings("application/octet-stream", staticContentType("data.bin"));
 }
 
+fn checkStaticParserInput(input: []const u8) !void {
+    var decoded_buffer: [512 + static_index.len]u8 = undefined;
+    if (decodeStaticPath(&decoded_buffer, input)) |decoded|
+        try testing.expect(decoded.len <= decoded_buffer.len);
+
+    const size = if (input.len >= @sizeOf(u64))
+        std.mem.readInt(u64, input[0..@sizeOf(u64)], .little)
+    else
+        @as(u64, input.len);
+    switch (parseByteRange(input, size)) {
+        .ignore, .unsatisfiable => {},
+        .range => |byte_range| {
+            try testing.expect(size > 0);
+            try testing.expect(byte_range.start <= byte_range.end);
+            try testing.expect(byte_range.end < size);
+        },
+    }
+    _ = etagListMatches(input, "W/\"fuzz\"");
+}
+
+fn fuzzStaticParsers(_: void, smith: *std.testing.Smith) !void {
+    var bytes: [512]u8 = undefined;
+    const len = smith.slice(&bytes);
+    try checkStaticParserInput(bytes[0..len]);
+}
+
+fn staticSmithSliceCorpus(comptime input: []const u8) [4 + input.len]u8 {
+    var result: [4 + input.len]u8 = undefined;
+    std.mem.writeInt(u32, result[0..4], input.len, .little);
+    @memcpy(result[4..], input);
+    return result;
+}
+
+test "static file parsers tolerate arbitrary input" {
+    const traversal = staticSmithSliceCorpus("assets/%2e%2e/secret");
+    const range = staticSmithSliceCorpus("bytes=18446744073709551615-");
+    const etag = staticSmithSliceCorpus("W/\"abc\", *");
+    try testing.fuzz({}, fuzzStaticParsers, .{
+        .corpus = &.{ &traversal, &range, &etag },
+    });
+}
+
 test "static files serve GET and HEAD and reject unsafe paths" {
     if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
     var threaded = std.Io.Threaded.init(testing.allocator, .{ .async_limit = .unlimited });

@@ -29,6 +29,21 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run the demo server");
     run_step.dependOn(&run_cmd.step);
 
+    const interop_server = b.addExecutable(.{
+        .name = "tls-interop-server",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/tls_interop_server.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "Linsang", .module = mod }},
+        }),
+    });
+    const interop_cmd = b.addSystemCommand(&.{"sh"});
+    interop_cmd.addFileArg(b.path("test/tls_interop.sh"));
+    interop_cmd.addArtifactArg(interop_server);
+    const interop_step = b.step("interop", "Test TLS with curl and OpenSSL");
+    interop_step.dependOn(&interop_cmd.step);
+
     // Tests: root.zig references every module, so this runs the whole suite.
     const mod_tests = b.addTest(.{ .root_module = mod });
     const run_mod_tests = b.addRunArtifact(mod_tests);
@@ -45,11 +60,16 @@ pub fn build(b: *std.Build) void {
         .root_module = fuzz_mod,
         .filters = &.{"protocol parsers tolerate arbitrary input"},
     });
+    const static_fuzz_tests = b.addTest(.{
+        .root_module = fuzz_mod,
+        .filters = &.{"static file parsers tolerate arbitrary input"},
+    });
     const tls_fuzz_tests = b.addTest(.{
         .root_module = fuzz_mod,
         .filters = &.{"client hello parser tolerates arbitrary input"},
     });
-    const fuzz_step = b.step("fuzz", "Fuzz HTTP, WebSocket, and TLS parsers");
+    const fuzz_step = b.step("fuzz", "Fuzz HTTP, static file, WebSocket, and TLS parsers");
     fuzz_step.dependOn(&b.addRunArtifact(protocol_fuzz_tests).step);
+    fuzz_step.dependOn(&b.addRunArtifact(static_fuzz_tests).step);
     fuzz_step.dependOn(&b.addRunArtifact(tls_fuzz_tests).step);
 }

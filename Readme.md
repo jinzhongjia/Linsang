@@ -15,7 +15,8 @@ spirit of [civetweb](https://github.com/civetweb/civetweb).
 - **TLS 1.2 + 1.3 server support**, with ALPN restricted to `http/1.1`.
 - **Heavily unit-tested**: parser, chunked decoding, WebSocket codec (incl. the
   RFC 6455 accept vector), and end-to-end HTTP, WebSocket, TLS 1.2, and TLS 1.3
-  over real TCP.
+  over real TCP. TLS is also checked against curl and OpenSSL with RSA and ECDSA
+  certificates.
 
 > **Status:** the networking layer now uses `std.Io.net`; the previous
 > socket/poller/reactor has been removed. Zig 0.16.0's Evented network vtable is
@@ -50,15 +51,17 @@ type-checked but not runtime-tested (no host available in this environment).
 ## Build
 
 ```sh
-zig build test    # run the full unit + integration suite
-zig build fuzz --fuzz=100K # bounded HTTP/WebSocket/TLS parser fuzzing
-zig build run     # start the demo server on http://0.0.0.0:8080 (WebSocket echo at /ws)
-zig build         # build the demo binary into zig-out/bin/linsang
+zig build test              # run the full unit + integration suite
+zig build fuzz --fuzz=100K  # bounded HTTP/static/WebSocket/TLS parser fuzzing
+zig build interop           # curl/OpenSSL × RSA/ECDSA × TLS 1.2/1.3
+zig build run               # start the demo server on http://0.0.0.0:8080
+zig build                   # build the demo binary into zig-out/bin/linsang
 ```
 
 The normal test suite also runs 10,000 deterministic random parser inputs and
-the fuzz seed corpora. Omit the `=100K` limit for continuous fuzzing. CI repeats
-the normal suite and cross-compiles the full five-target matrix.
+the fuzz seed corpora. Omit the `=100K` limit for continuous fuzzing. CI runs
+the normal, fuzz, and TLS interoperability suites, then cross-compiles the full
+five-target matrix.
 
 ## Use as a library
 
@@ -128,6 +131,9 @@ pub fn main() !void {
     try server.run(io); // accept loop + one std.Io task per connection
 }
 ```
+
+`CertKeyPair` verifies that the private key matches the leaf certificate while
+loading, before the server starts accepting TLS connections.
 
 `Config` knobs: `tls`, `read_buffer_size`, `max_body_size`, `max_ws_message_size`,
 `request_timeout`, `keep_alive_timeout`, `write_timeout`, `backlog`, `max_connections`,

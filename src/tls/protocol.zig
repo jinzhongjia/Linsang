@@ -86,6 +86,8 @@ pub const Extension = enum(u16) {
     signature_algorithms_cert = 50,
     /// RFC 8446
     key_share = 51,
+    /// RFC 5746
+    renegotiation_info = 0xff01,
 
     _,
 };
