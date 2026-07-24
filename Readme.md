@@ -99,7 +99,7 @@ pub fn main() !void {
 `request_timeout`, `keep_alive_timeout`, `write_timeout`, `backlog`, `max_connections`,
 `user_data`, and the `on_ws_open`/`on_ws_close` hooks. Set a timeout to `null`
 to disable it. `max_connections` defaults to 128; excess accepted connections
-are closed immediately so Threaded cannot grow its worker pool without bound.
+receive 503 and are closed so Threaded cannot grow its worker pool without bound.
 
 For managed lifetimes, `server.start(io)` returns a `Running` handle.
 `running.stop()` stops accepting, cancels active connections, and waits for

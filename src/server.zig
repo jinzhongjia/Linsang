@@ -48,6 +48,21 @@ pub const Server = struct {
             };
             if (active.fetchAdd(1, .monotonic) >= self.config.max_connections) {
                 _ = active.fetchSub(1, .monotonic);
+                var buffer: [128]u8 = undefined;
+                var writer = stream.writer(io, &buffer);
+                writer.interface.writeAll(
+                    "HTTP/1.1 503 Service Unavailable\r\n" ++
+                        "Content-Length: 0\r\nConnection: close\r\n\r\n",
+                ) catch {};
+                writer.interface.flush() catch {};
+                stream.shutdown(io, .send) catch {};
+                // ponytail: 1 ms drain avoids TCP RST; use a bounded reject group
+                // only if overload-response throughput matters.
+                var discard: [1024]u8 = undefined;
+                _ = stream.socket.receiveTimeout(io, &discard, .{ .duration = .{
+                    .clock = .awake,
+                    .raw = .fromMilliseconds(1),
+                } }) catch {};
                 stream.close(io);
                 continue;
             }
@@ -234,16 +249,14 @@ test "server enforces max connections" {
     var second_writer = second.writer(io, &second_buffer);
     try second_writer.interface.writeAll("GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
     try second_writer.interface.flush();
-    var byte: [1]u8 = undefined;
-    var parts = [1][]u8{&byte};
-    const rejected = io.vtable.netRead(io.userdata, second.socket.handle, &parts) catch |err| switch (err) {
-        error.ConnectionResetByPeer => 0,
-        else => return err,
-    };
-    try testing.expectEqual(
-        @as(usize, 0),
-        rejected,
-    );
+    var response: [128]u8 = undefined;
+    var parts = [1][]u8{&response};
+    const received = try io.vtable.netRead(io.userdata, second.socket.handle, &parts);
+    try testing.expect(std.mem.startsWith(
+        u8,
+        response[0..received],
+        "HTTP/1.1 503 Service Unavailable\r\n",
+    ));
     try testing.expectEqual(@as(usize, 1), count.load(.monotonic));
 
     try first.shutdown(io, .both);

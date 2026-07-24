@@ -106,7 +106,7 @@ This uses the pure protocol code in `http.zig` (`parseHead`, `decodeChunked`,
   and avoid deep recursion in handlers to keep stacks small.
 - Threaded deadlines use `std.Io.Select` tasks and therefore retain multiple
   worker threads per live connection. `max_connections` defaults to 128 and
-  immediately closes excess connections to keep that cost bounded.
+  responds 503 to excess connections before closing them to keep that cost bounded.
 - Long-lived allocation via a caller-provided allocator (`std.heap.page_allocator`
   in the demo; the Evented runtime also needs a backing allocator).
 
@@ -138,7 +138,7 @@ cancels the connection group, waits for task cleanup, and closes the listener.
 | File | Responsibility |
 |---|---|
 | `src/root.zig` | public API surface (re-exports) + test aggregator |
-| `src/main.zig` | demo server: builds an `Evented` `io` and runs the server |
+| `src/main.zig` | demo server: builds a Threaded `io` and runs the server |
 | `src/http.zig` | `Method`, `Status`, `Request`, `Response`, incremental parser, chunked decoder |
 | `src/websocket.zig` | RFC 6455 handshake + frame codec + `Assembler` |
 | `src/connection.zig` | straight-line per-connection handler + `Config`/handler API |

@@ -40,7 +40,7 @@ runtime**.
 - **Bounded time**: HTTP requests, keep-alive idle waits, and writes have
   configurable deadlines; shutdown cancels and drains connection tasks.
 - **Bounded concurrency**: `max_connections` defaults to 128; excess accepted
-  connections are closed immediately.
+  connections receive 503 and are closed immediately.
 
 ## Commands
 
@@ -78,7 +78,7 @@ Module map (target, all under `src/`):
 | File | Role |
 |---|---|
 | `root.zig` | public API re-exports + test aggregator |
-| `main.zig` | demo: build an `Evented` `io`, run the server |
+| `main.zig` | demo: build a Threaded `io`, run the server |
 | `http.zig` | `Method`/`Status`/`Request`/`Response` + parser + chunked decoder |
 | `websocket.zig` | RFC 6455 handshake + frame codec + `Assembler` |
 | `connection.zig` | straight-line per-connection handler + `Config`/handler API |
