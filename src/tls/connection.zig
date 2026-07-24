@@ -99,6 +99,7 @@ pub const Connection = struct {
             switch (content_type) {
                 .application_data => {},
                 .handshake => {
+                    if (cleartext.len == 0) return error.TlsUnexpectedMessage;
                     const handshake_type: proto.Handshake = @enumFromInt(cleartext[0]);
                     switch (handshake_type) {
                         .new_session_ticket => {
@@ -467,6 +468,32 @@ test "client/server connection" {
         try testing.expectEqual(n, nr);
         try testing.expectEqualSlices(u8, client_cleartext, server_cleartext);
     }
+}
+
+test "empty encrypted handshake is rejected" {
+    const Transcript = @import("transcript.zig").Transcript;
+    var client_secret: [64]u8 = undefined;
+    var server_secret: [64]u8 = undefined;
+    @memset(&client_secret, 1);
+    @memset(&server_secret, 2);
+    const secret = Transcript.Secret{
+        .client = &client_secret,
+        .server = &server_secret,
+    };
+    var client_cipher = try Cipher.initTls13(.AES_128_GCM_SHA256, secret, .client);
+    const server_cipher = try Cipher.initTls13(.AES_128_GCM_SHA256, secret, .server);
+
+    var ciphertext: [64]u8 = undefined;
+    const encrypted = try client_cipher.encrypt(&ciphertext, .handshake, &.{});
+    var input: Io.Reader = .fixed(encrypted);
+    var output_buf: [64]u8 = undefined;
+    var output: Io.Writer = .fixed(&output_buf);
+    var server: Connection = .{
+        .input = &input,
+        .output = &output,
+        .cipher = server_cipher,
+    };
+    try testing.expectError(error.TlsUnexpectedMessage, server.next());
 }
 
 pub const NonBlock = struct {

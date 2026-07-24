@@ -164,6 +164,14 @@ fn isToken(s: []const u8) bool {
     return true;
 }
 
+fn isFieldValue(s: []const u8) bool {
+    for (s) |c| {
+        if (c == '\r' or c == '\n' or (c < 0x20 and c != '\t') or c == 0x7f)
+            return false;
+    }
+    return true;
+}
+
 /// Parse request line + headers from the front of `buf`, filling `req`.
 pub fn parseHead(req: *Request, buf: []const u8) HeadResult {
     const head_end = (std.mem.indexOf(u8, buf, "\r\n\r\n") orelse return .need_more) + 4;
@@ -185,7 +193,9 @@ pub fn parseHead(req: *Request, buf: []const u8) HeadResult {
         const colon = std.mem.indexOfScalar(u8, line, ':') orelse return .{ .fail = .bad_request };
         const name = line[0..colon];
         if (!isToken(name)) return .{ .fail = .bad_request };
-        const value = std.mem.trim(u8, line[colon + 1 ..], " \t");
+        const raw_value = line[colon + 1 ..];
+        if (!isFieldValue(raw_value)) return .{ .fail = .bad_request };
+        const value = std.mem.trim(u8, raw_value, " \t");
         if (req.headers_len >= max_headers) return .{ .fail = .request_header_fields_too_large };
         req.headers_buf[req.headers_len] = .{ .name = name, .value = value };
         req.headers_len += 1;
@@ -204,7 +214,7 @@ fn parseRequestLine(req: *Request, line: []const u8) LineResult {
     const sp1 = std.mem.indexOfScalar(u8, line, ' ') orelse return .{ .fail = .bad_request };
     const method_str = line[0..sp1];
     const rest = line[sp1 + 1 ..];
-    const sp2 = std.mem.lastIndexOfScalar(u8, rest, ' ') orelse return .{ .fail = .bad_request };
+    const sp2 = std.mem.indexOfScalar(u8, rest, ' ') orelse return .{ .fail = .bad_request };
     const target = rest[0..sp2];
     const version = rest[sp2 + 1 ..];
 
@@ -216,7 +226,7 @@ fn parseRequestLine(req: *Request, line: []const u8) LineResult {
         return .{ .fail = .bad_request };
     }
 
-    if (target.len == 0) return .{ .fail = .bad_request };
+    if (target.len == 0 or !isRequestTarget(target)) return .{ .fail = .bad_request };
     req.target = target;
     if (std.mem.indexOfScalar(u8, target, '?')) |q| {
         req.path = target[0..q];
@@ -226,18 +236,30 @@ fn parseRequestLine(req: *Request, line: []const u8) LineResult {
         req.query = "";
     }
 
-    // Version: "HTTP/1.N".
+    // This server supports only HTTP/1.0 and HTTP/1.1.
     if (!std.mem.startsWith(u8, version, "HTTP/")) return .{ .fail = .bad_request };
     const ver = version["HTTP/".len..];
     if (ver.len != 3 or ver[1] != '.') return .{ .fail = .bad_request };
     if (!std.ascii.isDigit(ver[0]) or !std.ascii.isDigit(ver[2])) return .{ .fail = .bad_request };
-    if (ver[0] != '1') return .{ .fail = .http_version_not_supported };
+    if (ver[0] != '1' or (ver[2] != '0' and ver[2] != '1'))
+        return .{ .fail = .http_version_not_supported };
     req.minor_version = ver[2] - '0';
     return .ok;
 }
 
+fn isRequestTarget(target: []const u8) bool {
+    for (target) |c| {
+        if (c <= ' ' or c == 0x7f) return false;
+    }
+    return true;
+}
+
 fn deriveBodyFraming(req: *Request) LineResult {
     var host_count: usize = 0;
+    var content_length: ?u64 = null;
+    var transfer_encoding: ?[]const u8 = null;
+    var connection_close = false;
+    var connection_keep_alive = false;
     for (req.headers()) |header| {
         if (std.ascii.eqlIgnoreCase(header.name, "host")) {
             host_count += 1;
@@ -246,6 +268,15 @@ fn deriveBodyFraming(req: *Request) LineResult {
             if (!std.ascii.eqlIgnoreCase(header.value, "100-continue"))
                 return .{ .fail = .expectation_failed };
             req.expect_continue = req.minor_version >= 1;
+        } else if (std.ascii.eqlIgnoreCase(header.name, "connection")) {
+            connection_close = connection_close or headerHasToken(header.value, "close");
+            connection_keep_alive = connection_keep_alive or headerHasToken(header.value, "keep-alive");
+        } else if (std.ascii.eqlIgnoreCase(header.name, "content-length")) {
+            if (content_length != null) return .{ .fail = .bad_request };
+            content_length = parseContentLength(header.value) orelse return .{ .fail = .bad_request };
+        } else if (std.ascii.eqlIgnoreCase(header.name, "transfer-encoding")) {
+            if (transfer_encoding != null) return .{ .fail = .bad_request };
+            transfer_encoding = header.value;
         }
     }
     if (host_count > 1 or (req.minor_version >= 1 and host_count != 1))
@@ -253,23 +284,19 @@ fn deriveBodyFraming(req: *Request) LineResult {
 
     // keep-alive default: 1.1 on, 1.0 off, adjusted by Connection.
     req.keep_alive = req.minor_version >= 1;
-    if (req.header("connection")) |c| {
-        if (headerHasToken(c, "close")) req.keep_alive = false;
-        if (headerHasToken(c, "keep-alive")) req.keep_alive = true;
+    if (connection_close) {
+        req.keep_alive = false;
+    } else if (connection_keep_alive) {
+        req.keep_alive = true;
     }
-    const te = req.header("transfer-encoding");
-    const cl = req.header("content-length");
-    if (te != null and cl != null) return .{ .fail = .bad_request }; // smuggling
-    if (te) |t| {
-        // Only "chunked" (as the final/only coding) is supported.
-        const last = lastToken(t);
-        if (std.ascii.eqlIgnoreCase(last, "chunked")) {
-            req.chunked = true;
-        } else {
-            return .{ .fail = .not_implemented };
-        }
-    } else if (cl) |c| {
-        req.content_length = parseContentLength(c) orelse return .{ .fail = .bad_request };
+    if (transfer_encoding != null and content_length != null)
+        return .{ .fail = .bad_request };
+    if (transfer_encoding) |value| {
+        // We neither decode nor forward additional transfer codings.
+        if (!std.ascii.eqlIgnoreCase(value, "chunked")) return .{ .fail = .not_implemented };
+        req.chunked = true;
+    } else {
+        req.content_length = content_length;
     }
     return .ok;
 }
@@ -293,13 +320,6 @@ fn headerHasToken(field: []const u8, token: []const u8) bool {
         if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, part, " \t"), token)) return true;
     }
     return false;
-}
-
-fn lastToken(field: []const u8) []const u8 {
-    var it = std.mem.splitScalar(u8, field, ',');
-    var last: []const u8 = "";
-    while (it.next()) |part| last = std.mem.trim(u8, part, " \t");
-    return last;
 }
 
 // ---------------------------------------------------------------------------
@@ -334,11 +354,13 @@ pub fn decodeChunked(input: []const u8, out: []u8) ChunkResult {
             }
         }
 
-        if (input.len < r + size + 2) return .need_more;
-        if (w + size > out.len) return .{ .fail = .payload_too_large };
-        std.mem.copyForwards(u8, out[w .. w + size], input[r .. r + size]);
-        w += size;
-        r += size;
+        const chunk_len = std.math.cast(usize, size) orelse return .{ .fail = .payload_too_large };
+        if (chunk_len > out.len - w) return .{ .fail = .payload_too_large };
+        const input_remaining = input.len - r;
+        if (chunk_len > input_remaining or input_remaining - chunk_len < 2) return .need_more;
+        std.mem.copyForwards(u8, out[w..][0..chunk_len], input[r..][0..chunk_len]);
+        w += chunk_len;
+        r += chunk_len;
         if (!std.mem.eql(u8, input[r .. r + 2], "\r\n")) return .{ .fail = .bad_request };
         r += 2;
     }
@@ -350,7 +372,7 @@ fn parseHexSize(hex: []const u8) ?u64 {
     for (hex) |c| {
         const d = std.fmt.charToDigit(c, 16) catch return null;
         n = std.math.mul(u64, n, 16) catch return null;
-        n += d;
+        n = std.math.add(u64, n, d) catch return null;
     }
     return n;
 }
@@ -381,13 +403,21 @@ pub const Response = struct {
         self.body_buf.clearRetainingCapacity();
     }
 
-    /// Add a header. Do not set Content-Length or Connection — those are emitted
-    /// automatically by `serialize`.
+    /// Add a protocol-safe response header. Framing headers are emitted by
+    /// `serialize` and cannot be set by a handler.
     pub fn setHeader(self: *Response, name: []const u8, value: []const u8) !void {
+        if (!isToken(name) or !isFieldValue(value) or isManagedResponseHeader(name))
+            return error.InvalidHeader;
         try self.header_lines.appendSlice(self.gpa, name);
         try self.header_lines.appendSlice(self.gpa, ": ");
         try self.header_lines.appendSlice(self.gpa, value);
         try self.header_lines.appendSlice(self.gpa, "\r\n");
+    }
+
+    fn isManagedResponseHeader(name: []const u8) bool {
+        return std.ascii.eqlIgnoreCase(name, "content-length") or
+            std.ascii.eqlIgnoreCase(name, "transfer-encoding") or
+            std.ascii.eqlIgnoreCase(name, "connection");
     }
 
     pub fn write(self: *Response, bytes: []const u8) !void {
@@ -550,7 +580,7 @@ test "Host and Expect requirements" {
     try testing.expect(!req.expect_continue);
 }
 
-test "rejects: bad version, bad method chars, folding, smuggling, bad CL" {
+test "rejects: bad version, request-line ambiguity, folding, and bad framing" {
     var req: Request = .{};
     try testing.expectEqual(Status.http_version_not_supported, parseHead(&req, "GET / HTTP/2.0\r\n\r\n").fail);
     req.reset();
@@ -567,6 +597,18 @@ test "rejects: bad version, bad method chars, folding, smuggling, bad CL" {
     try testing.expectEqual(Status.bad_request, parseHead(&req, "POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 1x\r\n\r\n").fail);
     req.reset();
     try testing.expectEqual(Status.not_implemented, parseHead(&req, "POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: gzip\r\n\r\n").fail);
+    req.reset();
+    try testing.expectEqual(Status.not_implemented, parseHead(&req, "POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: gzip, chunked\r\n\r\n").fail);
+    req.reset();
+    try testing.expectEqual(Status.bad_request, parseHead(&req, "POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\n").fail);
+    req.reset();
+    try testing.expectEqual(Status.bad_request, parseHead(&req, "POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n\r\n").fail);
+    req.reset();
+    try testing.expectEqual(Status.bad_request, parseHead(&req, "GET /a b HTTP/1.1\r\nHost: a\r\n\r\n").fail);
+    req.reset();
+    try testing.expectEqual(Status.http_version_not_supported, parseHead(&req, "GET / HTTP/1.9\r\nHost: a\r\n\r\n").fail);
+    req.reset();
+    try testing.expectEqual(Status.bad_request, parseHead(&req, "GET / HTTP/1.1\r\nHost: a\rX-Test: y\r\n\r\n").fail);
     req.reset();
     try testing.expectEqual(Status.bad_request, parseHead(&req, "GET  HTTP/1.1\r\n\r\n").fail);
 }
@@ -607,6 +649,13 @@ test "decodeChunked need_more and errors" {
     try testing.expectEqual(Status.bad_request, decodeChunked("zz\r\n", &out).fail);
     var tiny: [2]u8 = undefined;
     try testing.expectEqual(Status.payload_too_large, decodeChunked("4\r\nWiki\r\n0\r\n\r\n", &tiny).fail);
+    var input = [_]u8{
+        '1', '\r', '\n', 'a', '\r', '\n',
+        'f', 'f',  'f',  'f', 'f',  'f',
+        'f', 'f',  'f',  'f', 'f',  'f',
+        'f', 'f',  'f',  'f', '\r', '\n',
+    };
+    try testing.expectEqual(Status.payload_too_large, decodeChunked(&input, &input).fail);
 }
 
 test "decodeChunked in-place aliasing" {
@@ -632,6 +681,18 @@ test "Response.serialize with body and headers" {
         "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nhi",
         out.items,
     );
+}
+
+test "Response rejects injected and framing headers" {
+    const gpa = testing.allocator;
+    var res = Response.init(gpa);
+    defer res.deinit();
+
+    try testing.expectError(error.InvalidHeader, res.setHeader("X-Test", "ok\r\nX-Evil: yes"));
+    try testing.expectError(error.InvalidHeader, res.setHeader("Bad Name", "value"));
+    try testing.expectError(error.InvalidHeader, res.setHeader("Content-Length", "0"));
+    try testing.expectError(error.InvalidHeader, res.setHeader("Transfer-Encoding", "chunked"));
+    try testing.expectError(error.InvalidHeader, res.setHeader("Connection", "close"));
 }
 
 test "Response.serialize close + empty body" {

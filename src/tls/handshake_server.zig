@@ -776,16 +776,10 @@ pub const Handshake = struct {
 
     fn tls12AuthCompatible(cipher_suite: CipherSuite, auth: AuthKind) bool {
         return switch (cipher_suite) {
-            .ECDHE_ECDSA_WITH_AES_128_CBC_SHA,
-            .ECDHE_ECDSA_WITH_AES_128_CBC_SHA256,
-            .ECDHE_ECDSA_WITH_AES_256_CBC_SHA384,
             .ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
             .ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
             .ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
             => auth == .ecdsa,
-            .ECDHE_RSA_WITH_AES_128_CBC_SHA,
-            .ECDHE_RSA_WITH_AES_128_CBC_SHA256,
-            .ECDHE_RSA_WITH_AES_256_CBC_SHA384,
             .ECDHE_RSA_WITH_AES_128_GCM_SHA256,
             .ECDHE_RSA_WITH_AES_256_GCM_SHA384,
             .ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
@@ -835,6 +829,16 @@ test "client hello parser tolerates arbitrary input" {
     try testing.fuzz({}, fuzzClientHello, .{
         .corpus = &.{ &tls12_seed, &tls13_seed },
     });
+}
+
+test "TLS 1.2 CBC suites are not selectable" {
+    const offered = [_]u8{ 0xc0, 0x13 }; // ECDHE_RSA_WITH_AES_128_CBC_SHA
+    try testing.expect(Handshake.selectCipher(
+        &.{.ECDHE_RSA_WITH_AES_128_CBC_SHA},
+        &offered,
+        .tls_1_2,
+        .rsa,
+    ) == null);
 }
 
 test "read client hello" {

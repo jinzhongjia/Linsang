@@ -35,6 +35,9 @@ pub const Config = struct {
     request_timeout: ?std.Io.Duration = .fromSeconds(15),
     /// How long an idle HTTP keep-alive connection waits for its next request.
     keep_alive_timeout: ?std.Io.Duration = .fromSeconds(60),
+    /// How long an idle WebSocket connection may stay silent. Set null only
+    /// when the application has its own liveness policy.
+    ws_idle_timeout: ?std.Io.Duration = .fromSeconds(60),
     /// Maximum time allowed to flush one HTTP response or WebSocket frame.
     write_timeout: ?std.Io.Duration = .fromSeconds(30),
     tls: ?TlsConfig = null,
@@ -289,7 +292,18 @@ pub const Connection = struct {
                         return;
                     }
                     try self.grow(limit);
-                    if (!try self.readMore(limit, .none)) return;
+                    const more = self.readMore(
+                        limit,
+                        durationTimeout(self.cfg.ws_idle_timeout),
+                    ) catch |err| switch (err) {
+                        error.Timeout => {
+                            self.wsClose(.going_away, "");
+                            try self.flush();
+                            return;
+                        },
+                        else => return err,
+                    };
+                    if (!more) return;
                 },
             }
         }
@@ -907,7 +921,7 @@ test "partial request times out with 408" {
     try group.await(io);
 }
 
-test "idle keep-alive closes and WebSocket close payloads are validated" {
+test "idle HTTP and WebSocket connections close and WebSocket close payloads are validated" {
     try testing.expectEqual(websocket.CloseCode.protocol_error, closePayloadError(&.{0}));
     try testing.expectEqual(
         websocket.CloseCode.protocol_error,
@@ -944,6 +958,25 @@ test "idle keep-alive closes and WebSocket close payloads are validated" {
         try io.vtable.netRead(io.userdata, client.socket.handle, &parts),
     );
     try group.await(io);
+
+    const ws_streams = try tcpPair(io);
+    const ws_client = ws_streams[0];
+    defer ws_client.close(io);
+    var ws_cfg: Config = .{
+        .ws_idle_timeout = .fromMilliseconds(20),
+        .on_request = upgradeHandler,
+    };
+    var ws_group: std.Io.Group = .init;
+    ws_group.async(io, runTestConnection, .{ io, ws_streams[1], &ws_cfg });
+    try writeTest(ws_client, io, "GET /ws HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\n" ++
+        "Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" ++
+        "Sec-WebSocket-Version: 13\r\n\r\n");
+    var handshake: [256]u8 = undefined;
+    _ = try readUntil(ws_client, io, &handshake, "\r\n\r\n");
+    var close: [4]u8 = undefined;
+    try readExact(ws_client, io, &close);
+    try testing.expectEqualSlices(u8, &.{ 0x88, 2, 0x03, 0xe9 }, &close);
+    try ws_group.await(io);
 }
 
 test "WebSocket upgrade and echo over std.Io.net" {

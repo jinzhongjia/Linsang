@@ -493,7 +493,7 @@ fn Aead13Type(comptime AeadType: type, comptime Hash: type) type {
             header.* = record.header(.application_data, payload_len);
 
             // Skip @memcpy if cleartext is already part of the buf at right position
-            if (&cleartext[0] != &buf[record.header_len]) {
+            if (cleartext.len > 0 and &cleartext[0] != &buf[record.header_len]) {
                 @memcpy(buf[record.header_len..][0..cleartext.len], cleartext);
             }
             buf[record.header_len + cleartext.len] = @intFromEnum(content_type);
@@ -738,18 +738,6 @@ pub const cipher_suites = struct {
         .ECDHE_RSA_WITH_AES_128_GCM_SHA256,
         .ECDHE_RSA_WITH_AES_256_GCM_SHA384,
     };
-    pub const tls12_weak = [_]CipherSuite{
-        // weak
-        .ECDHE_ECDSA_WITH_AES_128_CBC_SHA256,
-        .ECDHE_ECDSA_WITH_AES_256_CBC_SHA384,
-        .ECDHE_ECDSA_WITH_AES_128_CBC_SHA,
-        .ECDHE_RSA_WITH_AES_128_CBC_SHA256,
-        .ECDHE_RSA_WITH_AES_256_CBC_SHA384,
-        .ECDHE_RSA_WITH_AES_128_CBC_SHA,
-
-        .RSA_WITH_AES_128_CBC_SHA256,
-        .RSA_WITH_AES_128_CBC_SHA,
-    };
     pub const tls13_ = if (crypto.core.aes.has_hardware_support) [_]CipherSuite{
         .AES_128_GCM_SHA256,
         .AES_256_GCM_SHA384,
@@ -763,9 +751,9 @@ pub const cipher_suites = struct {
     };
 
     pub const tls13 = &tls13_;
-    pub const tls12 = &(tls12_secure ++ tls12_weak);
+    pub const tls12 = &tls12_secure;
     pub const secure = &(tls13_ ++ tls12_secure);
-    pub const all = &(tls13_ ++ tls12_secure ++ tls12_weak);
+    pub const all = secure;
 
     pub fn includes(list: []const CipherSuite, cs: CipherSuite) bool {
         for (list) |s| {
@@ -823,9 +811,9 @@ pub const CipherSuite = enum(u16) {
         for (list) |cs| {
             if (cipher_suites.includes(cipher_suites.tls12, cs)) {
                 has_12 = true;
-            } else {
-                if (cipher_suites.includes(cipher_suites.tls13, cs)) has_13 = true;
-            }
+            } else if (cipher_suites.includes(cipher_suites.tls13, cs)) {
+                has_13 = true;
+            } else return error.TlsIllegalParameter;
         }
         if (has_12 and has_13) return .both;
         if (has_12) return .tls_1_2;
@@ -893,8 +881,9 @@ test "CipherSuite validate" {
 
 test "CipherSuite versions" {
     try testing.expectEqual(.tls_1_3, CipherSuite.versions(&[_]CipherSuite{.AES_128_GCM_SHA256}));
-    try testing.expectEqual(.both, CipherSuite.versions(&[_]CipherSuite{ .AES_128_GCM_SHA256, .ECDHE_ECDSA_WITH_AES_128_CBC_SHA }));
-    try testing.expectEqual(.tls_1_2, CipherSuite.versions(&[_]CipherSuite{.RSA_WITH_AES_128_CBC_SHA}));
+    try testing.expectEqual(.both, CipherSuite.versions(&[_]CipherSuite{ .AES_128_GCM_SHA256, .ECDHE_ECDSA_WITH_AES_128_GCM_SHA256 }));
+    try testing.expectError(error.TlsIllegalParameter, CipherSuite.versions(&[_]CipherSuite{ .AES_128_GCM_SHA256, .ECDHE_ECDSA_WITH_AES_128_CBC_SHA }));
+    try testing.expectError(error.TlsIllegalParameter, CipherSuite.versions(&[_]CipherSuite{.RSA_WITH_AES_128_CBC_SHA}));
 }
 
 test "gcm 1.2 encrypt overhead" {
