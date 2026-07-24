@@ -53,6 +53,9 @@ zig build run     # start the demo server on http://0.0.0.0:8080 (WebSocket echo
 zig build         # build the demo binary into zig-out/bin/linsang
 ```
 
+The normal test suite also runs 10,000 deterministic random parser inputs.
+CI repeats it and cross-compiles the full five-target matrix.
+
 ## Use as a library
 
 The API threads a `std.Io` instance through the server:

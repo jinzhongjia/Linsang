@@ -31,11 +31,7 @@ test {
     _ = server;
 }
 
-fn fuzzProtocolParsers(_: void, smith: *std.testing.Smith) !void {
-    var bytes: [512]u8 = undefined;
-    const len: usize = smith.slice(&bytes);
-    const input = bytes[0..len];
-
+fn checkProtocolInput(input: []u8) !void {
     var request: http.Request = .{};
     switch (http.parseHead(&request, input)) {
         .done => |consumed| try std.testing.expect(consumed <= input.len),
@@ -57,6 +53,12 @@ fn fuzzProtocolParsers(_: void, smith: *std.testing.Smith) !void {
     }
 }
 
+fn fuzzProtocolParsers(_: void, smith: *std.testing.Smith) !void {
+    var bytes: [512]u8 = undefined;
+    const len: usize = smith.slice(&bytes);
+    try checkProtocolInput(bytes[0..len]);
+}
+
 test "protocol parsers tolerate arbitrary input" {
     try std.testing.fuzz({}, fuzzProtocolParsers, .{
         .corpus = &.{
@@ -65,4 +67,15 @@ test "protocol parsers tolerate arbitrary input" {
             "\x81\x82\x01\x02\x03\x04Hi",
         },
     });
+}
+
+test "protocol parsers tolerate 10K deterministic random inputs" {
+    var prng = std.Random.DefaultPrng.init(0x4c_69_6e_73_61_6e_67);
+    const random = prng.random();
+    var bytes: [512]u8 = undefined;
+    for (0..10_000) |_| {
+        const len = random.intRangeAtMost(usize, 0, bytes.len);
+        random.bytes(bytes[0..len]);
+        try checkProtocolInput(bytes[0..len]);
+    }
 }

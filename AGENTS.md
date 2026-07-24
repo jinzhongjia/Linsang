@@ -49,6 +49,9 @@ zig build run                  # demo server on :8080
 zig build -Dtarget=<t>         # cross-compile check (see targets below)
 ```
 
+The normal suite includes deterministic parser stress inputs; Zig's built-in
+`--fuzz` entry remains registered for toolchains where fuzz mode compiles.
+
 Cross-compile matrix that must keep compiling:
 `x86_64-linux aarch64-linux x86_64-macos aarch64-macos x86_64-windows`.
 
