@@ -63,12 +63,22 @@ fn fuzzProtocolParsers(_: void, smith: *std.testing.Smith) !void {
     try checkProtocolInput(bytes[0..len]);
 }
 
+fn smithSliceCorpus(comptime input: []const u8) [4 + input.len]u8 {
+    var result: [4 + input.len]u8 = undefined;
+    std.mem.writeInt(u32, result[0..4], input.len, .little);
+    @memcpy(result[4..], input);
+    return result;
+}
+
 test "protocol parsers tolerate arbitrary input" {
+    const http_seed = smithSliceCorpus("GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+    const chunked_seed = smithSliceCorpus("4\r\nWiki\r\n0\r\n\r\n");
+    const websocket_seed = smithSliceCorpus("\x81\x82\x01\x02\x03\x04Hi");
     try std.testing.fuzz({}, fuzzProtocolParsers, .{
         .corpus = &.{
-            "GET / HTTP/1.1\r\nHost: x\r\n\r\n",
-            "4\r\nWiki\r\n0\r\n\r\n",
-            "\x81\x82\x01\x02\x03\x04Hi",
+            &http_seed,
+            &chunked_seed,
+            &websocket_seed,
         },
     });
 }

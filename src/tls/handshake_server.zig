@@ -802,8 +802,40 @@ pub const Handshake = struct {
 };
 
 const testing = std.testing;
+const data12 = @import("testdata/tls12.zig");
 const data13 = @import("testdata/tls13.zig");
 const testu = @import("testu.zig");
+
+fn fuzzClientHello(_: void, smith: *testing.Smith) !void {
+    var bytes: [2048]u8 = undefined;
+    const len = smith.slice(&bytes);
+    var reader: Io.Reader = .fixed(bytes[0..len]);
+    var h: Handshake = .{
+        .input = &reader,
+        .output = undefined,
+        .signature_scheme = .ecdsa_secp256r1_sha256,
+    };
+    h.readClientHello(cipher_suites.secure, &.{"http/1.1"}) catch return;
+
+    try h.cipher_suite.validate();
+    try testing.expect(h.tls_version == .tls_1_2 or h.tls_version == .tls_1_3);
+    try testing.expect(@intFromEnum(h.named_group) != 0);
+}
+
+fn smithSliceCorpus(comptime input: []const u8) [4 + input.len]u8 {
+    var result: [4 + input.len]u8 = undefined;
+    std.mem.writeInt(u32, result[0..4], input.len, .little);
+    @memcpy(result[4..], input);
+    return result;
+}
+
+test "client hello parser tolerates arbitrary input" {
+    const tls12_seed = smithSliceCorpus(&data12.client_hello);
+    const tls13_seed = smithSliceCorpus(&data13.client_hello);
+    try testing.fuzz({}, fuzzClientHello, .{
+        .corpus = &.{ &tls12_seed, &tls13_seed },
+    });
+}
 
 test "read client hello" {
     var reader: Io.Reader = .fixed(&data13.client_hello);

@@ -46,13 +46,15 @@ runtime**.
 
 ```sh
 zig build test                 # full suite (must stay green)
+zig build fuzz --fuzz=100K     # bounded HTTP/WebSocket/TLS parser fuzzing
 zig test src/root.zig          # same, but prints the N/M pass count
 zig build run                  # demo server on :8080
 zig build -Dtarget=<t>         # cross-compile check (see targets below)
 ```
 
-The normal suite includes deterministic parser stress inputs; Zig's built-in
-`--fuzz` entry remains registered for toolchains where fuzz mode compiles.
+The normal suite includes deterministic parser stress inputs and fuzz corpus
+smoke tests. The dedicated fuzz step uses ReleaseFast because Zig 0.16's Debug
+fuzz runner has a `StackTrace` type mismatch.
 
 Cross-compile matrix that must keep compiling:
 `x86_64-linux aarch64-linux x86_64-macos aarch64-macos x86_64-windows`.
