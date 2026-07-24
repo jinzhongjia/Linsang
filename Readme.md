@@ -93,7 +93,13 @@ pub fn main() !void {
 ```
 
 `Config` knobs: `read_buffer_size`, `max_body_size`, `max_ws_message_size`,
-`backlog`, `user_data`, and the `on_ws_open`/`on_ws_close` hooks.
+`request_timeout`, `keep_alive_timeout`, `write_timeout`, `backlog`,
+`user_data`, and the `on_ws_open`/`on_ws_close` hooks. Set a timeout to `null`
+to disable it.
+
+For managed lifetimes, `server.start(io)` returns a `Running` handle.
+`running.stop()` stops accepting, cancels active connections, and waits for
+their cleanup.
 
 ## Design
 

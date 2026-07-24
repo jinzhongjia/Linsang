@@ -85,6 +85,10 @@ if keep-alive: reset and loop, else close
 on WebSocket upgrade: switch to a frame-read loop
 ```
 
+Each HTTP request has one overall deadline, so receiving occasional bytes does
+not keep a slowloris connection alive indefinitely. Keep-alive idle waits and
+writes have separate configurable timeouts.
+
 This reuses `http.zig` (`parseHead`, `decodeChunked`, `Response`) and
 `websocket.zig` (`checkUpgrade`, `parseFrame`, `writeFrame`, `Assembler`)
 verbatim.
@@ -121,6 +125,9 @@ parse/build, client-mask handling, text/binary + fragmentation reassembly
 All socket input is untrusted: parse error → 400, header too big → 431, body too
 big → 413, bad method/version → 501/505, malformed WS → protocol-error close. No
 panics on bad input; a failed connection just ends its fiber and closes.
+
+`Server.start` returns a cancelable running handle. Stopping cancels accept,
+cancels the connection group, waits for task cleanup, and closes the listener.
 
 ## Module layout (target)
 

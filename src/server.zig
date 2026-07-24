@@ -23,6 +23,13 @@ pub const Server = struct {
         });
     }
 
+    pub fn start(self: *Server, io: std.Io) Running {
+        return .{
+            .io = io,
+            .future = io.async(runAny, .{ self, io }),
+        };
+    }
+
     pub fn run(self: *Server, io: std.Io) !void {
         var listener = try self.listen(io);
         defer listener.deinit(io);
@@ -43,6 +50,27 @@ pub const Server = struct {
         }
     }
 };
+
+pub const Running = struct {
+    io: std.Io,
+    future: std.Io.Future(anyerror!void),
+
+    /// Stop accepting, cancel active connections, and wait for their cleanup.
+    pub fn stop(self: *Running) !void {
+        self.future.cancel(self.io) catch |err| switch (err) {
+            error.Canceled => {},
+            else => return err,
+        };
+    }
+
+    pub fn wait(self: *Running) !void {
+        try self.future.await(self.io);
+    }
+};
+
+fn runAny(server: *Server, io: std.Io) anyerror!void {
+    try server.run(io);
+}
 
 fn serveConnection(
     io: std.Io,
@@ -114,4 +142,18 @@ test "listen and serve HTTP over std.Io.net TCP" {
     try testing.expect(std.mem.startsWith(u8, response[0..len], "HTTP/1.1 200 OK\r\n"));
     try testing.expect(std.mem.indexOf(u8, response[0..len], "you asked for /road") != null);
     try group.await(io);
+}
+
+test "running server can be stopped cleanly" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    var threaded = std.Io.Threaded.init(testing.allocator, .{ .async_limit = .unlimited });
+    defer threaded.deinit();
+    const io = threaded.io();
+    var server = Server.init(testing.allocator, .{
+        .address = "127.0.0.1",
+        .port = 0,
+        .on_request = okHandler,
+    });
+    var running = server.start(io);
+    try running.stop();
 }

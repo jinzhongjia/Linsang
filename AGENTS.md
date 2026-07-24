@@ -37,6 +37,8 @@ runtime**.
   heavier than the old state machine, accepted for stdlib-tested networking. Keep
   buffers bounded and handler stacks shallow.
 - **Heavy unit tests**: every non-trivial function keeps a runnable test.
+- **Bounded time**: HTTP requests, keep-alive idle waits, and writes have
+  configurable deadlines; shutdown cancels and drains connection tasks.
 
 ## Commands
 

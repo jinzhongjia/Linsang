@@ -17,6 +17,12 @@ pub const Config = struct {
     read_buffer_size: usize = 8 * 1024,
     max_body_size: usize = 1 << 20,
     max_ws_message_size: usize = 1 << 20,
+    /// Overall deadline for one HTTP request, preventing slowloris clients.
+    request_timeout: ?std.Io.Duration = .fromSeconds(15),
+    /// How long an idle HTTP keep-alive connection waits for its next request.
+    keep_alive_timeout: ?std.Io.Duration = .fromSeconds(60),
+    /// Maximum time allowed to flush one HTTP response or WebSocket frame.
+    write_timeout: ?std.Io.Duration = .fromSeconds(30),
 
     on_request: *const fn (*const http.Request, *http.Response, ?*anyopaque) Action,
     on_ws_open: ?*const fn (*Connection, ?*anyopaque) void = null,
@@ -36,6 +42,7 @@ pub const Connection = struct {
     req: http.Request = .{},
     res: http.Response,
     ws_asm: websocket.Assembler,
+    requests_served: usize = 0,
     closing: bool = false,
     close_notified: bool = false,
 
@@ -62,6 +69,10 @@ pub const Connection = struct {
     fn run(self: *Connection) !void {
         while (true) switch (try self.readRequest()) {
             .eof => return,
+            .timeout => {
+                try self.sendError(.request_timeout);
+                return;
+            },
             .fail => |status| {
                 try self.sendError(status);
                 return;
@@ -74,6 +85,7 @@ pub const Connection = struct {
                         try self.res.serialize(&self.write_buf, self.gpa, keep_alive);
                         self.consume(consumed);
                         try self.flush();
+                        self.requests_served += 1;
                         if (!keep_alive) return;
                     },
                     .upgrade => {
@@ -87,19 +99,39 @@ pub const Connection = struct {
 
     const ReadResult = union(enum) {
         eof,
+        timeout,
         ready: usize,
         fail: http.Status,
     };
 
     fn readRequest(self: *Connection) !ReadResult {
         self.req.reset();
+        if (self.requests_served > 0 and self.read_len == 0) {
+            const more = self.readMore(
+                self.cfg.read_buffer_size,
+                durationTimeout(self.cfg.keep_alive_timeout),
+            ) catch |err| switch (err) {
+                error.Timeout => return .eof,
+                else => return err,
+            };
+            if (!more) return .eof;
+        }
+        const request_deadline =
+            durationTimeout(self.cfg.request_timeout).toDeadline(self.io);
         const head_len = while (true) switch (http.parseHead(&self.req, self.read_buf[0..self.read_len])) {
             .done => |n| break n,
             .fail => |status| return .{ .fail = status },
             .need_more => {
                 if (self.read_len >= self.cfg.read_buffer_size)
                     return .{ .fail = .request_header_fields_too_large };
-                if (!try self.readMore(self.cfg.read_buffer_size))
+                const more = self.readMore(
+                    self.cfg.read_buffer_size,
+                    request_deadline,
+                ) catch |err| switch (err) {
+                    error.Timeout => return .timeout,
+                    else => return err,
+                };
+                if (!more)
                     return if (self.read_len == 0) .eof else .{ .fail = .bad_request };
             },
         };
@@ -115,7 +147,11 @@ pub const Connection = struct {
                 return .{ .fail = .payload_too_large };
             try self.ensureCapacity(needed, self.httpBufferLimit());
             while (self.read_len < needed) {
-                if (!try self.readMore(needed)) return .{ .fail = .bad_request };
+                const more = self.readMore(needed, request_deadline) catch |err| switch (err) {
+                    error.Timeout => return .timeout,
+                    else => return err,
+                };
+                if (!more) return .{ .fail = .bad_request };
             }
             self.req.body = self.read_buf[head_len..needed];
             consumed = needed;
@@ -139,7 +175,11 @@ pub const Connection = struct {
                         const limit = self.httpBufferLimit();
                         if (self.read_len == limit) return .{ .fail = .payload_too_large };
                         try self.grow(limit);
-                        if (!try self.readMore(limit)) return .{ .fail = .bad_request };
+                        const more = self.readMore(limit, request_deadline) catch |err| switch (err) {
+                            error.Timeout => return .timeout,
+                            else => return err,
+                        };
+                        if (!more) return .{ .fail = .bad_request };
                     },
                 }
             }
@@ -192,7 +232,7 @@ pub const Connection = struct {
                         return;
                     }
                     try self.grow(limit);
-                    if (!try self.readMore(limit)) return;
+                    if (!try self.readMore(limit, .none)) return;
                 },
             }
         }
@@ -205,7 +245,20 @@ pub const Connection = struct {
                     self.wsClose(.internal_error, ""),
                 .pong => {},
                 .close => {
-                    websocket.writeClose(&self.write_buf, self.gpa, .normal, "") catch {};
+                    if (closePayloadError(frame.payload)) |code| {
+                        self.wsClose(code, "");
+                        return;
+                    }
+                    websocket.writeFrame(
+                        &self.write_buf,
+                        self.gpa,
+                        .close,
+                        frame.payload,
+                        true,
+                    ) catch {
+                        self.wsClose(.internal_error, "");
+                        return;
+                    };
                     self.closing = true;
                 },
                 else => unreachable,
@@ -220,14 +273,14 @@ pub const Connection = struct {
         }
     }
 
-    fn readMore(self: *Connection, limit: usize) !bool {
+    fn readMore(self: *Connection, limit: usize, timeout: std.Io.Timeout) !bool {
         const end = @min(limit, self.read_buf.len);
         std.debug.assert(self.read_len < end);
-        var buffers = [1][]u8{self.read_buf[self.read_len..end]};
-        const n = try self.io.vtable.netRead(
-            self.io.userdata,
+        const n = try timedRead(
+            self.io,
             self.stream.socket.handle,
-            &buffers,
+            self.read_buf[self.read_len..end],
+            timeout,
         );
         self.read_len += n;
         return n != 0;
@@ -261,10 +314,12 @@ pub const Connection = struct {
 
     fn flush(self: *Connection) !void {
         if (self.write_buf.items.len == 0) return;
-        var buffer: [1024]u8 = undefined;
-        var writer = self.stream.writer(self.io, &buffer);
-        try writer.interface.writeAll(self.write_buf.items);
-        try writer.interface.flush();
+        try timedWrite(
+            self.io,
+            self.stream,
+            self.write_buf.items,
+            durationTimeout(self.cfg.write_timeout),
+        );
         self.write_buf.clearRetainingCapacity();
     }
 
@@ -300,6 +355,97 @@ pub const Connection = struct {
         self.closing = true;
     }
 };
+
+fn closePayloadError(payload: []const u8) ?websocket.CloseCode {
+    if (payload.len == 0) return null;
+    if (payload.len == 1) return .protocol_error;
+    const code = std.mem.readInt(u16, payload[0..2], .big);
+    if (!validCloseCode(code)) return .protocol_error;
+    if (!std.unicode.utf8ValidateSlice(payload[2..])) return .invalid_payload;
+    return null;
+}
+
+fn validCloseCode(code: u16) bool {
+    return switch (code) {
+        1000...1003, 1007...1014, 3000...4999 => true,
+        else => false,
+    };
+}
+
+fn durationTimeout(duration: ?std.Io.Duration) std.Io.Timeout {
+    return if (duration) |value| .{ .duration = .{
+        .clock = .awake,
+        .raw = value,
+    } } else .none;
+}
+
+const ReadRace = union(enum) {
+    io: anyerror!usize,
+    timeout: std.Io.Cancelable!void,
+};
+
+fn timedRead(
+    io: std.Io,
+    socket_handle: std.Io.net.Socket.Handle,
+    buffer: []u8,
+    timeout: std.Io.Timeout,
+) !usize {
+    if (timeout == .none) return rawRead(io, socket_handle, buffer);
+    var results: [2]ReadRace = undefined;
+    var select = std.Io.Select(ReadRace).init(io, &results);
+    select.async(.io, rawRead, .{ io, socket_handle, buffer });
+    select.async(.timeout, waitTimeout, .{ io, timeout });
+    defer select.cancelDiscard();
+    return switch (try select.await()) {
+        .io => |result| try result,
+        .timeout => |result| {
+            try result;
+            return error.Timeout;
+        },
+    };
+}
+
+fn rawRead(io: std.Io, socket_handle: std.Io.net.Socket.Handle, buffer: []u8) !usize {
+    var buffers = [1][]u8{buffer};
+    return io.vtable.netRead(io.userdata, socket_handle, &buffers);
+}
+
+const WriteRace = union(enum) {
+    io: anyerror!void,
+    timeout: std.Io.Cancelable!void,
+};
+
+fn timedWrite(
+    io: std.Io,
+    stream: Stream,
+    bytes: []const u8,
+    timeout: std.Io.Timeout,
+) !void {
+    if (timeout == .none) return rawWrite(io, stream, bytes);
+    var results: [2]WriteRace = undefined;
+    var select = std.Io.Select(WriteRace).init(io, &results);
+    select.async(.io, rawWrite, .{ io, stream, bytes });
+    select.async(.timeout, waitTimeout, .{ io, timeout });
+    defer select.cancelDiscard();
+    switch (try select.await()) {
+        .io => |result| try result,
+        .timeout => |result| {
+            try result;
+            return error.Timeout;
+        },
+    }
+}
+
+fn rawWrite(io: std.Io, stream: Stream, bytes: []const u8) !void {
+    var buffer: [1024]u8 = undefined;
+    var writer = stream.writer(io, &buffer);
+    try writer.interface.writeAll(bytes);
+    try writer.interface.flush();
+}
+
+fn waitTimeout(io: std.Io, timeout: std.Io.Timeout) std.Io.Cancelable!void {
+    try timeout.sleep(io);
+}
 
 pub fn handle(io: std.Io, stream: Stream, gpa: Allocator, cfg: *const Config) !void {
     defer stream.close(io);
@@ -424,6 +570,68 @@ test "chunked body may arrive in pieces" {
     var response: [512]u8 = undefined;
     const complete = try readUntil(client, io, &response, "Wikipedia");
     try testing.expect(std.mem.endsWith(u8, complete, "Wikipedia"));
+    try group.await(io);
+}
+
+test "partial request times out with 408" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    var threaded = std.Io.Threaded.init(testing.allocator, .{ .async_limit = .unlimited });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const streams = try tcpPair(io);
+    const client = streams[0];
+    defer client.close(io);
+    const server = streams[1];
+    var cfg: Config = .{
+        .request_timeout = .fromMilliseconds(20),
+        .on_request = helloHandler,
+    };
+    var group: std.Io.Group = .init;
+    group.async(io, runTestConnection, .{ io, server, &cfg });
+
+    try writeTest(client, io, "GET /slow");
+    var response: [256]u8 = undefined;
+    const complete = try readUntil(client, io, &response, "\r\n\r\n");
+    try testing.expect(std.mem.startsWith(u8, complete, "HTTP/1.1 408"));
+    try group.await(io);
+}
+
+test "idle keep-alive closes and WebSocket close payloads are validated" {
+    try testing.expectEqual(websocket.CloseCode.protocol_error, closePayloadError(&.{0}));
+    try testing.expectEqual(
+        websocket.CloseCode.protocol_error,
+        closePayloadError(&.{ 0x03, 0xed }),
+    );
+    try testing.expectEqual(
+        websocket.CloseCode.invalid_payload,
+        closePayloadError(&.{ 0x03, 0xe8, 0xff }),
+    );
+    try testing.expect(closePayloadError(&.{ 0x03, 0xe8, 'b', 'y', 'e' }) == null);
+
+    if (@import("builtin").os.tag != .linux) return;
+    var threaded = std.Io.Threaded.init(testing.allocator, .{ .async_limit = .unlimited });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const streams = try tcpPair(io);
+    const client = streams[0];
+    defer client.close(io);
+    const server = streams[1];
+    var cfg: Config = .{
+        .keep_alive_timeout = .fromMilliseconds(20),
+        .on_request = helloHandler,
+    };
+    var group: std.Io.Group = .init;
+    group.async(io, runTestConnection, .{ io, server, &cfg });
+
+    try writeTest(client, io, "GET /idle HTTP/1.1\r\n\r\n");
+    var response: [256]u8 = undefined;
+    _ = try readUntil(client, io, &response, "path=/idle");
+    var byte: [1]u8 = undefined;
+    var parts = [1][]u8{&byte};
+    try testing.expectEqual(
+        @as(usize, 0),
+        try io.vtable.netRead(io.userdata, client.socket.handle, &parts),
+    );
     try group.await(io);
 }
 
