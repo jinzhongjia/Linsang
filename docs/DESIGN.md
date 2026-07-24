@@ -120,8 +120,10 @@ keep-alive (honor `Connection: close`), `Expect: 100-continue`, buffered
 `Content-Length` responses and chunked streaming responses. A handler may return
 `.files` to serve GET/HEAD below an already-opened `std.Io.Dir`; paths are
 percent-decoded, traversal and symlinks are rejected, and files are copied in
-bounded chunks. Directory indexes, range requests, and conditional caching are
-out of scope until an application needs them.
+bounded chunks. Directory URLs ending in `/` resolve to `index.html`. Static
+responses include weak metadata ETags, honor `If-None-Match`, and support a
+single byte range with 206/416 responses. Generated directory listings and
+multipart byte ranges remain out of scope.
 
 Also out of scope (YAGNI): HTTP/2, pipelining, compression, multipart.
 

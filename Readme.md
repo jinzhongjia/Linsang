@@ -136,6 +136,10 @@ to disable it. `max_connections` defaults to 128; excess accepted connections
 receive 503 on plaintext listeners, or are closed before TLS negotiation, so
 Threaded cannot grow its worker pool without bound.
 
+The `.files` action serves GET/HEAD below its opened directory. Directory URLs
+ending in `/` resolve to `index.html`; responses include a weak metadata ETag,
+support `If-None-Match`, and support one byte range per request.
+
 For managed lifetimes, `server.start(io)` returns a `Running` handle.
 `running.stop()` stops accepting, cancels active connections, and waits for
 their cleanup.
@@ -150,9 +154,9 @@ a fiber; under Threaded it uses the runtime's thread pool.
 ## Scope
 
 **In:** HTTP/1.1 keep-alive, buffered and streaming responses, `Content-Length`
-+ chunked bodies (both directions), bounded-memory static file GET/HEAD,
-WebSocket handshake + framing + fragmentation + ping/pong/close, and TLS
-1.2/1.3 server transport.
++ chunked bodies (both directions), bounded-memory static file GET/HEAD with
+`index.html`, Range, and ETag, WebSocket handshake + framing + fragmentation +
+ping/pong/close, and TLS 1.2/1.3 server transport.
 
 **Out (by design):** HTTP/2, pipelining, compression, multipart, TLS client
 mode, TLS session resumption, and mTLS. TLS advertises only `http/1.1` through

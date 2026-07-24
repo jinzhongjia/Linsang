@@ -143,13 +143,14 @@ pub const Connection = struct {
         }
 
         const raw_path = self.req.path;
-        if (raw_path.len < 2 or raw_path[0] != '/') {
+        if (raw_path.len == 0 or raw_path[0] != '/') {
             self.res.status = .not_found;
             return self.bufferedResponse(consumed);
         }
-        const path_buffer = try self.gpa.dupe(u8, raw_path[1..]);
+        const encoded_path = raw_path[1..];
+        const path_buffer = try self.gpa.alloc(u8, encoded_path.len + static_index.len);
         defer self.gpa.free(path_buffer);
-        const path = decodeStaticPath(path_buffer) orelse {
+        const path = decodeStaticPath(path_buffer, encoded_path) orelse {
             self.res.status = .not_found;
             return self.bufferedResponse(consumed);
         };
@@ -170,19 +171,79 @@ pub const Connection = struct {
             return self.bufferedResponse(consumed);
         }
 
+        var etag_buffer: [96]u8 = undefined;
+        const etag = staticEtag(&etag_buffer, stat);
+        try self.res.setHeader("ETag", etag);
+        try self.res.setHeader("Accept-Ranges", "bytes");
+        if (self.req.header("if-none-match")) |value| {
+            if (etagListMatches(value, etag)) {
+                self.res.status = .not_modified;
+                const keep_alive = self.req.keep_alive;
+                try self.res.serializeKnownLength(
+                    &self.write_buf,
+                    self.gpa,
+                    keep_alive,
+                    stat.size,
+                );
+                self.consume(consumed);
+                try self.flush();
+                self.requests_served += 1;
+                return keep_alive;
+            }
+        }
+
+        var body_start: u64 = 0;
+        var body_end = stat.size;
+        if (self.req.method == .GET and
+            self.req.header("range") != null and
+            self.req.header("if-range") == null)
+        {
+            switch (parseByteRange(self.req.header("range").?, stat.size)) {
+                .ignore => {},
+                .unsatisfiable => {
+                    self.res.status = .range_not_satisfiable;
+                    var content_range_buffer: [64]u8 = undefined;
+                    const content_range = std.fmt.bufPrint(
+                        &content_range_buffer,
+                        "bytes */{d}",
+                        .{stat.size},
+                    ) catch unreachable;
+                    try self.res.setHeader("Content-Range", content_range);
+                    return self.bufferedResponse(consumed);
+                },
+                .range => |byte_range| {
+                    self.res.status = .partial_content;
+                    body_start = byte_range.start;
+                    body_end = byte_range.end + 1;
+                    var content_range_buffer: [96]u8 = undefined;
+                    const content_range = std.fmt.bufPrint(
+                        &content_range_buffer,
+                        "bytes {d}-{d}/{d}",
+                        .{ byte_range.start, byte_range.end, stat.size },
+                    ) catch unreachable;
+                    try self.res.setHeader("Content-Range", content_range);
+                },
+            }
+        }
+
         try self.res.setHeader("Content-Type", staticContentType(path));
         try self.res.setHeader("X-Content-Type-Options", "nosniff");
         const keep_alive = self.req.keep_alive;
-        try self.res.serializeKnownLength(&self.write_buf, self.gpa, keep_alive, stat.size);
+        try self.res.serializeKnownLength(
+            &self.write_buf,
+            self.gpa,
+            keep_alive,
+            body_end - body_start,
+        );
         try self.flush();
 
         if (self.req.method == .GET) {
-            var offset: u64 = 0;
+            var offset = body_start;
             var buffer: [16 * 1024]u8 = undefined;
-            while (offset < stat.size) {
+            while (offset < body_end) {
                 const length: usize = @intCast(@min(
                     @as(u64, buffer.len),
-                    stat.size - offset,
+                    body_end - offset,
                 ));
                 var parts = [1][]u8{buffer[0..length]};
                 const n = try file.readPositional(self.io, &parts, offset);
@@ -532,18 +593,21 @@ pub const Connection = struct {
     }
 };
 
-fn decodeStaticPath(buffer: []u8) ?[]u8 {
+const static_index = "index.html";
+
+fn decodeStaticPath(buffer: []u8, encoded: []const u8) ?[]u8 {
+    if (buffer.len < encoded.len + static_index.len) return null;
     var read: usize = 0;
     var write: usize = 0;
-    while (read < buffer.len) {
-        const byte = if (buffer[read] == '%') byte: {
-            if (buffer.len - read < 3) return null;
-            const value = std.fmt.parseInt(u8, buffer[read + 1 .. read + 3], 16) catch
+    while (read < encoded.len) {
+        const byte = if (encoded[read] == '%') byte: {
+            if (encoded.len - read < 3) return null;
+            const value = std.fmt.parseInt(u8, encoded[read + 1 .. read + 3], 16) catch
                 return null;
             read += 3;
             break :byte value;
         } else byte: {
-            const value = buffer[read];
+            const value = encoded[read];
             read += 1;
             break :byte value;
         };
@@ -552,9 +616,12 @@ fn decodeStaticPath(buffer: []u8) ?[]u8 {
         buffer[write] = byte;
         write += 1;
     }
+    if (write == 0 or buffer[write - 1] == '/') {
+        @memcpy(buffer[write..][0..static_index.len], static_index);
+        write += static_index.len;
+    }
 
     const path = buffer[0..write];
-    if (path.len == 0) return null;
     var components = std.mem.splitScalar(u8, path, '/');
     while (components.next()) |component| {
         if (component.len == 0 or
@@ -565,6 +632,80 @@ fn decodeStaticPath(buffer: []u8) ?[]u8 {
         }
     }
     return path;
+}
+
+const ByteRange = struct {
+    start: u64,
+    end: u64,
+};
+
+const ByteRangeResult = union(enum) {
+    ignore,
+    unsatisfiable,
+    range: ByteRange,
+};
+
+fn parseByteRange(header: []const u8, size: u64) ByteRangeResult {
+    const value = std.mem.trim(u8, header, " \t");
+    if (value.len < "bytes=".len or
+        !std.ascii.eqlIgnoreCase(value[0.."bytes=".len], "bytes="))
+    {
+        return .ignore;
+    }
+    const spec = std.mem.trim(u8, value["bytes=".len..], " \t");
+    // ponytail: multi-range requires multipart/byteranges; ignore it until a
+    // caller actually needs more than resumable downloads and media seeking.
+    if (spec.len == 0 or std.mem.indexOfScalar(u8, spec, ',') != null)
+        return .ignore;
+    const dash = std.mem.indexOfScalar(u8, spec, '-') orelse return .ignore;
+    const first = std.mem.trim(u8, spec[0..dash], " \t");
+    const last = std.mem.trim(u8, spec[dash + 1 ..], " \t");
+    if (first.len == 0) {
+        if (last.len == 0) return .ignore;
+        const suffix = std.fmt.parseInt(u64, last, 10) catch return .ignore;
+        if (suffix == 0 or size == 0) return .unsatisfiable;
+        const length = @min(suffix, size);
+        return .{ .range = .{
+            .start = size - length,
+            .end = size - 1,
+        } };
+    }
+
+    const start = std.fmt.parseInt(u64, first, 10) catch return .ignore;
+    if (start >= size) return .unsatisfiable;
+    if (last.len == 0) return .{ .range = .{
+        .start = start,
+        .end = size - 1,
+    } };
+    const requested_end = std.fmt.parseInt(u64, last, 10) catch return .ignore;
+    if (requested_end < start) return .ignore;
+    return .{ .range = .{
+        .start = start,
+        .end = @min(requested_end, size - 1),
+    } };
+}
+
+fn staticEtag(buffer: []u8, stat: std.Io.File.Stat) []const u8 {
+    // ponytail: metadata makes a cheap weak validator; hash file contents only
+    // if callers need a byte-identical validator across timestamp collisions.
+    const mtime_bits: u96 = @bitCast(stat.mtime.nanoseconds);
+    return std.fmt.bufPrint(buffer, "W/\"{x}-{x}-{x}\"", .{
+        stat.inode,
+        stat.size,
+        mtime_bits,
+    }) catch unreachable;
+}
+
+fn etagListMatches(header: []const u8, etag: []const u8) bool {
+    const current = if (std.mem.startsWith(u8, etag, "W/")) etag[2..] else etag;
+    var values = std.mem.splitScalar(u8, header, ',');
+    while (values.next()) |raw| {
+        const value = std.mem.trim(u8, raw, " \t");
+        if (std.mem.eql(u8, value, "*")) return true;
+        const candidate = if (std.mem.startsWith(u8, value, "W/")) value[2..] else value;
+        if (std.mem.eql(u8, candidate, current)) return true;
+    }
+    return false;
 }
 
 fn openStaticFile(io: std.Io, root: std.Io.Dir, path: []const u8) !std.Io.File {
@@ -823,6 +964,34 @@ fn staticHandler(_: *const http.Request, _: *http.Response, user_data: ?*anyopaq
     return .{ .files = files.* };
 }
 
+fn staticTestRequest(
+    io: std.Io,
+    files: *const StaticFiles,
+    request: []const u8,
+    response: []u8,
+    terminator: []const u8,
+) ![]u8 {
+    const streams = try tcpPair(io);
+    const client = streams[0];
+    defer client.close(io);
+    var cfg: Config = .{
+        .on_request = staticHandler,
+        .user_data = @constCast(files),
+    };
+    var server_future = io.async(handle, .{
+        io,
+        streams[1],
+        testing.allocator,
+        &cfg,
+    });
+    defer server_future.cancel(io) catch {};
+
+    try writeTest(client, io, request);
+    const complete = try readUntil(client, io, response, terminator);
+    try server_future.await(io);
+    return complete;
+}
+
 fn echoHandler(conn: *Connection, message: websocket.Message, _: ?*anyopaque) void {
     conn.sendText(message.data) catch {};
 }
@@ -873,12 +1042,19 @@ fn tcpPair(io: std.Io) ![2]Stream {
     return .{ client, try listener.accept(io) };
 }
 
-test "static path decoding and content types" {
-    var encoded = "assets%2Fapp.js".*;
-    try testing.expectEqualStrings("assets/app.js", decodeStaticPath(&encoded).?);
+test "static path, range, ETag, and content type helpers" {
+    var decoded: [64]u8 = undefined;
+    try testing.expectEqualStrings(
+        "assets/app.js",
+        decodeStaticPath(&decoded, "assets%2Fapp.js").?,
+    );
+    try testing.expectEqualStrings("index.html", decodeStaticPath(&decoded, "").?);
+    try testing.expectEqualStrings(
+        "assets/index.html",
+        decodeStaticPath(&decoded, "assets/").?,
+    );
 
     const rejected = [_][]const u8{
-        "",
         "..",
         "assets/../secret",
         "%2e%2e/secret",
@@ -891,11 +1067,26 @@ test "static path decoding and content types" {
         "bad%zz",
     };
     for (rejected) |input| {
-        const copy = try testing.allocator.dupe(u8, input);
-        defer testing.allocator.free(copy);
-        try testing.expect(decodeStaticPath(copy) == null);
+        try testing.expect(decodeStaticPath(&decoded, input) == null);
     }
 
+    const closed = parseByteRange("bytes=2-5", 10).range;
+    try testing.expectEqual(@as(u64, 2), closed.start);
+    try testing.expectEqual(@as(u64, 5), closed.end);
+    const open = parseByteRange("bytes=7-", 10).range;
+    try testing.expectEqual(@as(u64, 7), open.start);
+    try testing.expectEqual(@as(u64, 9), open.end);
+    const suffix = parseByteRange("bytes=-3", 10).range;
+    try testing.expectEqual(@as(u64, 7), suffix.start);
+    try testing.expectEqual(@as(u64, 9), suffix.end);
+    try testing.expect(parseByteRange("bytes=10-", 10) == .unsatisfiable);
+    try testing.expect(parseByteRange("bytes=-0", 10) == .unsatisfiable);
+    try testing.expect(parseByteRange("bytes=5-3", 10) == .ignore);
+    try testing.expect(parseByteRange("bytes=0-1,4-5", 10) == .ignore);
+
+    try testing.expect(etagListMatches("\"abc\", W/\"def\"", "W/\"def\""));
+    try testing.expect(etagListMatches("*", "W/\"def\""));
+    try testing.expect(!etagListMatches("\"abc\"", "W/\"def\""));
     try testing.expectEqualStrings("text/html; charset=utf-8", staticContentType("index.HTML"));
     try testing.expectEqualStrings("application/wasm", staticContentType("pkg/module.wasm"));
     try testing.expectEqualStrings("application/octet-stream", staticContentType("data.bin"));
@@ -918,6 +1109,10 @@ test "static files serve GET and HEAD and reject unsafe paths" {
         .sub_path = "app.js",
         .data = "console.log('ok');",
     });
+    try public.writeFile(testing.io, .{
+        .sub_path = "index.html",
+        .data = "<h1>asset index</h1>",
+    });
     public.close(testing.io);
     public = try tmp.dir.openDir(testing.io, "public", .{});
     defer public.close(testing.io);
@@ -929,6 +1124,7 @@ test "static files serve GET and HEAD and reject unsafe paths" {
         request: []const u8,
         terminator: []const u8,
         expected: []const u8,
+        expected_also: ?[]const u8 = null,
         absent: ?[]const u8 = null,
     }{
         .{
@@ -940,6 +1136,24 @@ test "static files serve GET and HEAD and reject unsafe paths" {
             .request = "HEAD /assets/app.js HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
             .terminator = "\r\n\r\n",
             .expected = "Content-Length: 18\r\n",
+            .absent = "console.log",
+        },
+        .{
+            .request = "GET /assets/ HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+            .terminator = "<h1>asset index</h1>",
+            .expected = "Content-Type: text/html; charset=utf-8\r\n",
+        },
+        .{
+            .request = "GET /assets/app.js HTTP/1.1\r\nHost: x\r\nRange: bytes=8-10\r\nConnection: close\r\n\r\n",
+            .terminator = "log",
+            .expected = "HTTP/1.1 206 Partial Content\r\n",
+            .expected_also = "Content-Range: bytes 8-10/18\r\n",
+        },
+        .{
+            .request = "GET /assets/app.js HTTP/1.1\r\nHost: x\r\nRange: bytes=99-\r\nConnection: close\r\n\r\n",
+            .terminator = "\r\n\r\n",
+            .expected = "HTTP/1.1 416 Range Not Satisfiable\r\n",
+            .expected_also = "Content-Range: bytes */18\r\n",
             .absent = "console.log",
         },
         .{
@@ -968,30 +1182,53 @@ test "static files serve GET and HEAD and reject unsafe paths" {
     };
 
     for (cases) |case| {
-        const streams = try tcpPair(io);
-        const client = streams[0];
-        defer client.close(io);
-        const server_stream = streams[1];
-        var cfg: Config = .{
-            .on_request = staticHandler,
-            .user_data = @constCast(&files),
-        };
-        var server_future = io.async(handle, .{
-            io,
-            server_stream,
-            testing.allocator,
-            &cfg,
-        });
-        defer server_future.cancel(io) catch {};
-
-        try writeTest(client, io, case.request);
         var response: [1024]u8 = undefined;
-        const complete = try readUntil(client, io, &response, case.terminator);
+        const complete = try staticTestRequest(
+            io,
+            &files,
+            case.request,
+            &response,
+            case.terminator,
+        );
         try testing.expect(std.mem.indexOf(u8, complete, case.expected) != null);
+        if (case.expected_also) |expected|
+            try testing.expect(std.mem.indexOf(u8, complete, expected) != null);
         if (case.absent) |absent|
             try testing.expect(std.mem.indexOf(u8, complete, absent) == null);
-        try server_future.await(io);
     }
+
+    var initial_response: [1024]u8 = undefined;
+    const initial = try staticTestRequest(
+        io,
+        &files,
+        "GET /assets/app.js HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+        &initial_response,
+        "console.log('ok');",
+    );
+    const etag_prefix = "ETag: ";
+    const etag_start = (std.mem.indexOf(u8, initial, etag_prefix) orelse
+        return error.TestUnexpectedResult) + etag_prefix.len;
+    const etag_end = std.mem.indexOfPos(u8, initial, etag_start, "\r\n") orelse
+        return error.TestUnexpectedResult;
+    const etag = initial[etag_start..etag_end];
+    var conditional_request: [256]u8 = undefined;
+    const request = try std.fmt.bufPrint(
+        &conditional_request,
+        "GET /assets/app.js HTTP/1.1\r\nHost: x\r\nIf-None-Match: {s}\r\nConnection: close\r\n\r\n",
+        .{etag},
+    );
+    var conditional_response: [1024]u8 = undefined;
+    const not_modified = try staticTestRequest(
+        io,
+        &files,
+        request,
+        &conditional_response,
+        "\r\n\r\n",
+    );
+    try testing.expect(std.mem.startsWith(u8, not_modified, "HTTP/1.1 304 Not Modified\r\n"));
+    const body_start = (std.mem.indexOf(u8, not_modified, "\r\n\r\n") orelse
+        return error.TestUnexpectedResult) + 4;
+    try testing.expectEqual(@as(usize, 0), not_modified[body_start..].len);
 }
 
 test "TLS 1.2 and 1.3 serve HTTP through the same connection path" {

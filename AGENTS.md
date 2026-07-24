@@ -128,7 +128,8 @@ event coalescing. `std.Io.net` handles all of this now.
 ## Scope
 
 **In**: keep-alive, buffered + streaming responses, `Content-Length` + chunked
-(both directions), bounded-memory static file GET/HEAD, WebSocket
+(both directions), bounded-memory static file GET/HEAD with `index.html`,
+single-range requests, and ETag/304, WebSocket
 handshake/framing/fragmentation/ping-pong-close, TLS 1.2/1.3 server transport.
 **Out**: HTTP/2, pipelining, compression, multipart, TLS client mode, session
 resumption, early data, mTLS.
