@@ -117,9 +117,13 @@ This uses the pure protocol code in `http.zig` (`parseHead`, `decodeChunked`,
 
 Incremental request parser (request-line, headers, `Content-Length` + chunked),
 keep-alive (honor `Connection: close`), `Expect: 100-continue`, buffered
-`Content-Length` responses and chunked streaming responses. Out of scope
-(YAGNI): HTTP/2, pipelining, compression, multipart.
-Static file serving = optional example handler, not core.
+`Content-Length` responses and chunked streaming responses. A handler may return
+`.files` to serve GET/HEAD below an already-opened `std.Io.Dir`; paths are
+percent-decoded, traversal and symlinks are rejected, and files are copied in
+bounded chunks. Directory indexes, range requests, and conditional caching are
+out of scope until an application needs them.
+
+Also out of scope (YAGNI): HTTP/2, pipelining, compression, multipart.
 
 ## WebSocket (RFC 6455)
 

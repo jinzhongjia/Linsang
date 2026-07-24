@@ -446,12 +446,23 @@ pub const Response = struct {
         try self.serializeImpl(out, gpa, keep_alive, false, if (chunked) .chunked else .close_delimited);
     }
 
+    /// Emit headers for a body whose length is known but whose bytes will be
+    /// written separately.
+    pub fn serializeKnownLength(self: *const Response, out: *std.ArrayList(u8), gpa: Allocator, keep_alive: bool, content_length: u64) !void {
+        try self.serializeImpl(out, gpa, keep_alive, false, .{ .known_length = content_length });
+    }
+
     pub fn bodyAllowed(self: *const Response) bool {
         const status_code = @intFromEnum(self.status);
         return status_code >= 200 and self.status != .no_content and self.status != .not_modified;
     }
 
-    const Framing = enum { buffered, chunked, close_delimited };
+    const Framing = union(enum) {
+        buffered,
+        known_length: u64,
+        chunked,
+        close_delimited,
+    };
 
     fn serializeImpl(
         self: *const Response,
@@ -473,6 +484,10 @@ pub const Response = struct {
         switch (framing) {
             .buffered => if (status_code >= 200 and self.status != .no_content) {
                 const cl = std.fmt.bufPrint(&line, "Content-Length: {d}\r\n", .{self.body_buf.items.len}) catch unreachable;
+                try out.appendSlice(gpa, cl);
+            },
+            .known_length => |content_length| if (status_code >= 200 and self.status != .no_content) {
+                const cl = std.fmt.bufPrint(&line, "Content-Length: {d}\r\n", .{content_length}) catch unreachable;
                 try out.appendSlice(gpa, cl);
             },
             .chunked => if (body_allowed)
@@ -742,6 +757,21 @@ test "Response.serializeStream selects chunked or close framing" {
     try res.serializeStream(&out, gpa, false, false);
     try testing.expectEqualStrings(
         "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n",
+        out.items,
+    );
+}
+
+test "Response.serializeKnownLength writes framing without buffering the body" {
+    const gpa = testing.allocator;
+    var res = Response.init(gpa);
+    defer res.deinit();
+    try res.setHeader("Content-Type", "text/plain");
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    try res.serializeKnownLength(&out, gpa, true, 123);
+    try testing.expectEqualStrings(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 123\r\nConnection: keep-alive\r\n\r\n",
         out.items,
     );
 }

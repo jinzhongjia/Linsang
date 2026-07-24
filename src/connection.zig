@@ -11,9 +11,16 @@ const Stream = std.Io.net.Stream;
 /// Produces a streamed response body. Returning completes the body.
 pub const StreamHandler = *const fn (*const http.Request, *Connection, ?*anyopaque) anyerror!void;
 
+/// Serves regular files below an already-opened directory. Symbolic links and
+/// path traversal are rejected.
+pub const StaticFiles = struct {
+    dir: std.Io.Dir,
+};
+
 pub const Action = union(enum) {
     respond,
     stream: StreamHandler,
+    files: StaticFiles,
     upgrade,
 };
 
@@ -100,19 +107,12 @@ pub const Connection = struct {
             .ready => |consumed| {
                 self.res.reset();
                 switch (self.cfg.on_request(&self.req, &self.res, self.cfg.user_data)) {
-                    .respond => {
-                        const keep_alive = self.req.keep_alive;
-                        if (self.req.method == .HEAD)
-                            try self.res.serializeHead(&self.write_buf, self.gpa, keep_alive)
-                        else
-                            try self.res.serialize(&self.write_buf, self.gpa, keep_alive);
-                        self.consume(consumed);
-                        try self.flush();
-                        self.requests_served += 1;
-                        if (!keep_alive) return;
-                    },
+                    .respond => if (!try self.bufferedResponse(consumed)) return,
                     .stream => |callback| {
                         if (!try self.streamResponse(consumed, callback)) return;
+                    },
+                    .files => |files| {
+                        if (!try self.staticResponse(consumed, files)) return;
                     },
                     .upgrade => {
                         if (!try self.upgrade(consumed)) return;
@@ -121,6 +121,84 @@ pub const Connection = struct {
                 }
             },
         };
+    }
+
+    fn bufferedResponse(self: *Connection, consumed: usize) !bool {
+        const keep_alive = self.req.keep_alive;
+        if (self.req.method == .HEAD)
+            try self.res.serializeHead(&self.write_buf, self.gpa, keep_alive)
+        else
+            try self.res.serialize(&self.write_buf, self.gpa, keep_alive);
+        self.consume(consumed);
+        try self.flush();
+        self.requests_served += 1;
+        return keep_alive;
+    }
+
+    fn staticResponse(self: *Connection, consumed: usize, files: StaticFiles) !bool {
+        if (self.req.method != .GET and self.req.method != .HEAD) {
+            self.res.status = .method_not_allowed;
+            try self.res.setHeader("Allow", "GET, HEAD");
+            return self.bufferedResponse(consumed);
+        }
+
+        const raw_path = self.req.path;
+        if (raw_path.len < 2 or raw_path[0] != '/') {
+            self.res.status = .not_found;
+            return self.bufferedResponse(consumed);
+        }
+        const path_buffer = try self.gpa.dupe(u8, raw_path[1..]);
+        defer self.gpa.free(path_buffer);
+        const path = decodeStaticPath(path_buffer) orelse {
+            self.res.status = .not_found;
+            return self.bufferedResponse(consumed);
+        };
+
+        var file = openStaticFile(self.io, files.dir, path) catch |err| {
+            if (err == error.Canceled) return err;
+            self.res.status = staticErrorStatus(err);
+            return self.bufferedResponse(consumed);
+        };
+        defer file.close(self.io);
+        const stat = file.stat(self.io) catch |err| {
+            if (err == error.Canceled) return err;
+            self.res.status = staticErrorStatus(err);
+            return self.bufferedResponse(consumed);
+        };
+        if (stat.kind != .file) {
+            self.res.status = .not_found;
+            return self.bufferedResponse(consumed);
+        }
+
+        try self.res.setHeader("Content-Type", staticContentType(path));
+        try self.res.setHeader("X-Content-Type-Options", "nosniff");
+        const keep_alive = self.req.keep_alive;
+        try self.res.serializeKnownLength(&self.write_buf, self.gpa, keep_alive, stat.size);
+        try self.flush();
+
+        if (self.req.method == .GET) {
+            var offset: u64 = 0;
+            var buffer: [16 * 1024]u8 = undefined;
+            while (offset < stat.size) {
+                const length: usize = @intCast(@min(
+                    @as(u64, buffer.len),
+                    stat.size - offset,
+                ));
+                var parts = [1][]u8{buffer[0..length]};
+                const n = try file.readPositional(self.io, &parts, offset);
+                if (n == 0) return error.EndOfStream;
+                try timedWrite(
+                    self,
+                    buffer[0..n],
+                    durationTimeout(self.cfg.write_timeout),
+                );
+                offset += n;
+            }
+        }
+
+        self.consume(consumed);
+        self.requests_served += 1;
+        return keep_alive;
     }
 
     fn streamResponse(self: *Connection, consumed: usize, callback: StreamHandler) !bool {
@@ -454,6 +532,108 @@ pub const Connection = struct {
     }
 };
 
+fn decodeStaticPath(buffer: []u8) ?[]u8 {
+    var read: usize = 0;
+    var write: usize = 0;
+    while (read < buffer.len) {
+        const byte = if (buffer[read] == '%') byte: {
+            if (buffer.len - read < 3) return null;
+            const value = std.fmt.parseInt(u8, buffer[read + 1 .. read + 3], 16) catch
+                return null;
+            read += 3;
+            break :byte value;
+        } else byte: {
+            const value = buffer[read];
+            read += 1;
+            break :byte value;
+        };
+        if (byte < 0x20 or byte == 0x7f or byte == '\\' or byte == ':')
+            return null;
+        buffer[write] = byte;
+        write += 1;
+    }
+
+    const path = buffer[0..write];
+    if (path.len == 0) return null;
+    var components = std.mem.splitScalar(u8, path, '/');
+    while (components.next()) |component| {
+        if (component.len == 0 or
+            std.mem.eql(u8, component, ".") or
+            std.mem.eql(u8, component, ".."))
+        {
+            return null;
+        }
+    }
+    return path;
+}
+
+fn openStaticFile(io: std.Io, root: std.Io.Dir, path: []const u8) !std.Io.File {
+    var components = std.mem.splitScalar(u8, path, '/');
+    var component = components.next() orelse return error.FileNotFound;
+    var dir = root;
+    var owns_dir = false;
+    defer if (owns_dir) dir.close(io);
+
+    while (components.next()) |next| {
+        const child = try dir.openDir(io, component, .{
+            .follow_symlinks = false,
+        });
+        if (owns_dir) dir.close(io);
+        dir = child;
+        owns_dir = true;
+        component = next;
+    }
+    return dir.openFile(io, component, .{
+        .allow_directory = false,
+        .follow_symlinks = false,
+    });
+}
+
+fn staticErrorStatus(err: anyerror) http.Status {
+    return switch (err) {
+        error.FileNotFound,
+        error.NotDir,
+        error.IsDir,
+        error.BadPathName,
+        error.NameTooLong,
+        => .not_found,
+        error.AccessDenied,
+        error.PermissionDenied,
+        error.SymLinkLoop,
+        => .forbidden,
+        else => .internal_server_error,
+    };
+}
+
+fn staticContentType(path: []const u8) []const u8 {
+    const extension = std.fs.path.extension(path);
+    const types = .{
+        .{ ".html", "text/html; charset=utf-8" },
+        .{ ".htm", "text/html; charset=utf-8" },
+        .{ ".css", "text/css; charset=utf-8" },
+        .{ ".js", "text/javascript; charset=utf-8" },
+        .{ ".mjs", "text/javascript; charset=utf-8" },
+        .{ ".json", "application/json" },
+        .{ ".txt", "text/plain; charset=utf-8" },
+        .{ ".xml", "application/xml" },
+        .{ ".svg", "image/svg+xml" },
+        .{ ".png", "image/png" },
+        .{ ".jpg", "image/jpeg" },
+        .{ ".jpeg", "image/jpeg" },
+        .{ ".gif", "image/gif" },
+        .{ ".webp", "image/webp" },
+        .{ ".ico", "image/x-icon" },
+        .{ ".pdf", "application/pdf" },
+        .{ ".wasm", "application/wasm" },
+        .{ ".woff", "font/woff" },
+        .{ ".woff2", "font/woff2" },
+    };
+    inline for (types) |entry| {
+        if (std.ascii.eqlIgnoreCase(extension, entry[0])) return entry[1];
+    }
+    return "application/octet-stream";
+}
+
 fn closePayloadError(payload: []const u8) ?websocket.CloseCode {
     if (payload.len == 0) return null;
     if (payload.len == 1) return .protocol_error;
@@ -638,6 +818,11 @@ fn streamBody(_: *const http.Request, conn: *Connection, _: ?*anyopaque) !void {
     try conn.writeChunk("pedia");
 }
 
+fn staticHandler(_: *const http.Request, _: *http.Response, user_data: ?*anyopaque) Action {
+    const files: *const StaticFiles = @ptrCast(@alignCast(user_data.?));
+    return .{ .files = files.* };
+}
+
 fn echoHandler(conn: *Connection, message: websocket.Message, _: ?*anyopaque) void {
     conn.sendText(message.data) catch {};
 }
@@ -686,6 +871,127 @@ fn tcpPair(io: std.Io) ![2]Stream {
     const client = try peer_address.connect(io, .{ .mode = .stream });
     errdefer client.close(io);
     return .{ client, try listener.accept(io) };
+}
+
+test "static path decoding and content types" {
+    var encoded = "assets%2Fapp.js".*;
+    try testing.expectEqualStrings("assets/app.js", decodeStaticPath(&encoded).?);
+
+    const rejected = [_][]const u8{
+        "",
+        "..",
+        "assets/../secret",
+        "%2e%2e/secret",
+        "/etc/passwd",
+        "assets//app.js",
+        "assets%5capp.js",
+        "C:%5csecret",
+        "bad%",
+        "bad%2",
+        "bad%zz",
+    };
+    for (rejected) |input| {
+        const copy = try testing.allocator.dupe(u8, input);
+        defer testing.allocator.free(copy);
+        try testing.expect(decodeStaticPath(copy) == null);
+    }
+
+    try testing.expectEqualStrings("text/html; charset=utf-8", staticContentType("index.HTML"));
+    try testing.expectEqualStrings("application/wasm", staticContentType("pkg/module.wasm"));
+    try testing.expectEqualStrings("application/octet-stream", staticContentType("data.bin"));
+}
+
+test "static files serve GET and HEAD and reject unsafe paths" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    var threaded = std.Io.Threaded.init(testing.allocator, .{ .async_limit = .unlimited });
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(testing.io, .{
+        .sub_path = "secret.txt",
+        .data = "not public",
+    });
+    var public = try tmp.dir.createDirPathOpen(testing.io, "public/assets", .{});
+    try public.writeFile(testing.io, .{
+        .sub_path = "app.js",
+        .data = "console.log('ok');",
+    });
+    public.close(testing.io);
+    public = try tmp.dir.openDir(testing.io, "public", .{});
+    defer public.close(testing.io);
+    try public.symLink(testing.io, "../secret.txt", "link.txt", .{});
+    try public.symLink(testing.io, "..", "escape", .{ .is_directory = true });
+
+    const files: StaticFiles = .{ .dir = public };
+    const cases = [_]struct {
+        request: []const u8,
+        terminator: []const u8,
+        expected: []const u8,
+        absent: ?[]const u8 = null,
+    }{
+        .{
+            .request = "GET /assets/app.js HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+            .terminator = "console.log('ok');",
+            .expected = "Content-Type: text/javascript; charset=utf-8\r\n",
+        },
+        .{
+            .request = "HEAD /assets/app.js HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+            .terminator = "\r\n\r\n",
+            .expected = "Content-Length: 18\r\n",
+            .absent = "console.log",
+        },
+        .{
+            .request = "GET /%2e%2e/secret.txt HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+            .terminator = "\r\n\r\n",
+            .expected = "HTTP/1.1 404 Not Found\r\n",
+            .absent = "not public",
+        },
+        .{
+            .request = "GET /link.txt HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+            .terminator = "\r\n\r\n",
+            .expected = "HTTP/1.1 403 Forbidden\r\n",
+            .absent = "not public",
+        },
+        .{
+            .request = "GET /escape/secret.txt HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+            .terminator = "\r\n\r\n",
+            .expected = "HTTP/1.1 404 Not Found\r\n",
+            .absent = "not public",
+        },
+        .{
+            .request = "POST /assets/app.js HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            .terminator = "\r\n\r\n",
+            .expected = "HTTP/1.1 405 Method Not Allowed\r\nAllow: GET, HEAD\r\n",
+        },
+    };
+
+    for (cases) |case| {
+        const streams = try tcpPair(io);
+        const client = streams[0];
+        defer client.close(io);
+        const server_stream = streams[1];
+        var cfg: Config = .{
+            .on_request = staticHandler,
+            .user_data = @constCast(&files),
+        };
+        var server_future = io.async(handle, .{
+            io,
+            server_stream,
+            testing.allocator,
+            &cfg,
+        });
+        defer server_future.cancel(io) catch {};
+
+        try writeTest(client, io, case.request);
+        var response: [1024]u8 = undefined;
+        const complete = try readUntil(client, io, &response, case.terminator);
+        try testing.expect(std.mem.indexOf(u8, complete, case.expected) != null);
+        if (case.absent) |absent|
+            try testing.expect(std.mem.indexOf(u8, complete, absent) == null);
+        try server_future.await(io);
+    }
 }
 
 test "TLS 1.2 and 1.3 serve HTTP through the same connection path" {

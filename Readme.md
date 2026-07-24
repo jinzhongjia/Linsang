@@ -68,9 +68,15 @@ The API threads a `std.Io` instance through the server:
 const std = @import("std");
 const linsang = @import("Linsang");
 
+const App = struct {
+    files: linsang.StaticFiles,
+};
+
 fn onRequest(req: *const linsang.Request, res: *linsang.Response, ud: ?*anyopaque) linsang.Action {
-    _ = ud;
+    const app: *const App = @ptrCast(@alignCast(ud.?));
     if (std.mem.eql(u8, req.path, "/ws")) return .upgrade; // hand off to WebSocket
+    if (std.mem.startsWith(u8, req.path, "/assets/"))
+        return .{ .files = app.files };
     if (std.mem.eql(u8, req.path, "/stream")) {
         res.setHeader("Content-Type", "text/plain") catch {};
         return .{ .stream = streamBody };
@@ -98,6 +104,10 @@ pub fn main() !void {
     defer threaded.deinit();
     const io = threaded.io();
 
+    var public = try std.Io.Dir.cwd().openDir(io, "public", .{});
+    defer public.close(io);
+    var app: App = .{ .files = .{ .dir = public } };
+
     var auth = try linsang.tls.CertKeyPair.fromFilePath(
         gpa,
         io,
@@ -113,6 +123,7 @@ pub fn main() !void {
         .tls = .{ .auth = &auth }, // omit for plaintext
         .on_request = onRequest,
         .on_ws_message = onMessage, // optional
+        .user_data = &app,
     });
     try server.run(io); // accept loop + one std.Io task per connection
 }
@@ -139,8 +150,9 @@ a fiber; under Threaded it uses the runtime's thread pool.
 ## Scope
 
 **In:** HTTP/1.1 keep-alive, buffered and streaming responses, `Content-Length`
-+ chunked bodies (both directions), WebSocket handshake + framing +
-fragmentation + ping/pong/close, and TLS 1.2/1.3 server transport.
++ chunked bodies (both directions), bounded-memory static file GET/HEAD,
+WebSocket handshake + framing + fragmentation + ping/pong/close, and TLS
+1.2/1.3 server transport.
 
 **Out (by design):** HTTP/2, pipelining, compression, multipart, TLS client
 mode, TLS session resumption, and mTLS. TLS advertises only `http/1.1` through

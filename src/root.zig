@@ -18,6 +18,7 @@ pub const TlsConfig = connection.TlsConfig;
 pub const Connection = connection.Connection;
 pub const Action = connection.Action;
 pub const StreamHandler = connection.StreamHandler;
+pub const StaticFiles = connection.StaticFiles;
 pub const Server = server.Server;
 
 pub const Request = http.Request;
