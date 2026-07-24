@@ -13,6 +13,7 @@ pub const Config = struct {
     address: []const u8 = "0.0.0.0",
     port: u16 = 8080,
     backlog: u31 = 128,
+    max_connections: usize = 128,
     /// Maximum request-head size and initial per-connection allocation.
     read_buffer_size: usize = 8 * 1024,
     max_body_size: usize = 1 << 20,

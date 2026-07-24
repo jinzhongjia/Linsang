@@ -89,9 +89,9 @@ Each HTTP request has one overall deadline, so receiving occasional bytes does
 not keep a slowloris connection alive indefinitely. Keep-alive idle waits and
 writes have separate configurable timeouts.
 
-This reuses `http.zig` (`parseHead`, `decodeChunked`, `Response`) and
-`websocket.zig` (`checkUpgrade`, `parseFrame`, `writeFrame`, `Assembler`)
-verbatim.
+This uses the pure protocol code in `http.zig` (`parseHead`, `decodeChunked`,
+`Response`) and `websocket.zig` (`checkUpgrade`, frame writers, `parseFrame`,
+`Assembler`).
 
 ## Memory
 
@@ -104,14 +104,18 @@ verbatim.
   This is heavier than the previous state-machine-per-connection but was accepted
   in exchange for stdlib-tested networking and simpler code. Keep buffers bounded
   and avoid deep recursion in handlers to keep stacks small.
+- Threaded deadlines use `std.Io.Select` tasks and therefore retain multiple
+  worker threads per live connection. `max_connections` defaults to 128 and
+  immediately closes excess connections to keep that cost bounded.
 - Long-lived allocation via a caller-provided allocator (`std.heap.page_allocator`
   in the demo; the Evented runtime also needs a backing allocator).
 
 ## HTTP/1.1
 
 Incremental request parser (request-line, headers, `Content-Length` + chunked),
-keep-alive (honor `Connection: close`), response builder (`Content-Length`).
-Out of scope (YAGNI): HTTP/2, pipelining, compression, multipart, 100-continue.
+keep-alive (honor `Connection: close`), `Expect: 100-continue`, response builder
+(`Content-Length`). Out of scope (YAGNI): HTTP/2, pipelining, compression,
+multipart.
 Static file serving = optional example handler, not core.
 
 ## WebSocket (RFC 6455)
@@ -135,8 +139,8 @@ cancels the connection group, waits for task cleanup, and closes the listener.
 |---|---|
 | `src/root.zig` | public API surface (re-exports) + test aggregator |
 | `src/main.zig` | demo server: builds an `Evented` `io` and runs the server |
-| `src/http.zig` | `Method`, `Status`, `Request`, `Response`, incremental parser, chunked decoder *(unchanged)* |
-| `src/websocket.zig` | RFC 6455 handshake + frame codec + `Assembler` *(unchanged)* |
+| `src/http.zig` | `Method`, `Status`, `Request`, `Response`, incremental parser, chunked decoder |
+| `src/websocket.zig` | RFC 6455 handshake + frame codec + `Assembler` |
 | `src/connection.zig` | straight-line per-connection handler + `Config`/handler API |
 | `src/server.zig` | `Server`: `std.Io.net` listen + accept loop + fiber-per-connection |
 

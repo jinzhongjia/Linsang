@@ -16,6 +16,7 @@ pub const Server = struct {
     }
 
     pub fn listen(self: *const Server, io: std.Io) !NetServer {
+        if (self.config.max_connections == 0) return error.InvalidConfiguration;
         const address = try std.Io.net.IpAddress.parse(self.config.address, self.config.port);
         return address.listen(io, .{
             .kernel_backlog = self.config.backlog,
@@ -33,19 +34,29 @@ pub const Server = struct {
     pub fn run(self: *Server, io: std.Io) !void {
         var listener = try self.listen(io);
         defer listener.deinit(io);
+        try self.serve(io, &listener);
+    }
 
+    fn serve(self: *Server, io: std.Io, listener: *NetServer) !void {
         var connections: std.Io.Group = .init;
         defer connections.cancel(io);
+        var active: std.atomic.Value(usize) = .init(0);
         while (true) {
             const stream = listener.accept(io) catch |err| switch (err) {
                 error.ConnectionAborted => continue,
                 else => return err,
             };
-            connections.async(io, serveConnection, .{
+            if (active.fetchAdd(1, .monotonic) >= self.config.max_connections) {
+                _ = active.fetchSub(1, .monotonic);
+                stream.close(io);
+                continue;
+            }
+            connections.async(io, serveLimitedConnection, .{
                 io,
                 stream,
                 self.gpa,
                 &self.config,
+                &active,
             });
         }
     }
@@ -83,12 +94,37 @@ fn serveConnection(
     };
 }
 
+fn serveLimitedConnection(
+    io: std.Io,
+    stream: std.Io.net.Stream,
+    gpa: Allocator,
+    config: *const Config,
+    active: *std.atomic.Value(usize),
+) std.Io.Cancelable!void {
+    defer _ = active.fetchSub(1, .monotonic);
+    try serveConnection(io, stream, gpa, config);
+}
+
 const http = @import("http.zig");
 const testing = std.testing;
 
 fn okHandler(req: *const http.Request, res: *http.Response, _: ?*anyopaque) connection.Action {
     res.print("you asked for {s}", .{req.path}) catch {};
     return .respond;
+}
+
+fn countHandler(_: *const http.Request, _: *http.Response, data: ?*anyopaque) connection.Action {
+    const count: *std.atomic.Value(usize) = @ptrCast(@alignCast(data.?));
+    _ = count.fetchAdd(1, .monotonic);
+    return .respond;
+}
+
+fn waitForCount(io: std.Io, count: *const std.atomic.Value(usize), expected: usize) !void {
+    for (0..100) |_| {
+        if (count.load(.monotonic) == expected) return;
+        try std.Io.sleep(io, .fromMilliseconds(1), .awake);
+    }
+    return error.Timeout;
 }
 
 fn acceptOne(
@@ -156,6 +192,61 @@ test "running server can be stopped cleanly" {
     });
     var running = server.start(io);
     try running.stop();
+}
+
+test "server enforces max connections" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    var threaded = std.Io.Threaded.init(testing.allocator, .{ .async_limit = .unlimited });
+    defer threaded.deinit();
+    const io = threaded.io();
+    var invalid = Server.init(testing.allocator, .{
+        .max_connections = 0,
+        .on_request = countHandler,
+    });
+    try testing.expectError(error.InvalidConfiguration, invalid.listen(io));
+    var count: std.atomic.Value(usize) = .init(0);
+    var server = Server.init(testing.allocator, .{
+        .address = "127.0.0.1",
+        .port = 0,
+        .max_connections = 1,
+        .on_request = countHandler,
+        .user_data = &count,
+    });
+    var listener = try server.listen(io);
+    defer listener.deinit(io);
+    var serving = io.async(Server.serve, .{ &server, io, &listener });
+    defer serving.cancel(io) catch {};
+    const address: std.Io.net.IpAddress = .{
+        .ip4 = .loopback(listener.socket.address.getPort()),
+    };
+
+    const first = try address.connect(io, .{ .mode = .stream });
+    defer first.close(io);
+    var first_buffer: [128]u8 = undefined;
+    var first_writer = first.writer(io, &first_buffer);
+    try first_writer.interface.writeAll("GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+    try first_writer.interface.flush();
+    try waitForCount(io, &count, 1);
+
+    const second = try address.connect(io, .{ .mode = .stream });
+    defer second.close(io);
+    var second_buffer: [128]u8 = undefined;
+    var second_writer = second.writer(io, &second_buffer);
+    try second_writer.interface.writeAll("GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+    try second_writer.interface.flush();
+    var byte: [1]u8 = undefined;
+    var parts = [1][]u8{&byte};
+    const rejected = io.vtable.netRead(io.userdata, second.socket.handle, &parts) catch |err| switch (err) {
+        error.ConnectionResetByPeer => 0,
+        else => return err,
+    };
+    try testing.expectEqual(
+        @as(usize, 0),
+        rejected,
+    );
+    try testing.expectEqual(@as(usize, 1), count.load(.monotonic));
+
+    try first.shutdown(io, .both);
 }
 
 fn acceptMany(

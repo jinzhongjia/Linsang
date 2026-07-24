@@ -13,7 +13,7 @@ spirit of civetweb. Plaintext phase. TLS 1.3 is Phase 2 (not started).
 The networking layer now uses **`std.Io.net`** driven by the **`std.Io`
 runtime**.
 
-- **Keep**: `http.zig`, `websocket.zig` (pure protocol code — reused verbatim).
+- **Keep**: `http.zig`, `websocket.zig` as pure protocol code.
 - **Removed**: `socket.zig` and `poller.zig` (hand-rolled per-OS sockets +
   readiness poller).
 - `connection.zig` and `server.zig` use straight-line handlers and
@@ -39,6 +39,8 @@ runtime**.
 - **Heavy unit tests**: every non-trivial function keeps a runnable test.
 - **Bounded time**: HTTP requests, keep-alive idle waits, and writes have
   configurable deadlines; shutdown cancels and drains connection tasks.
+- **Bounded concurrency**: `max_connections` defaults to 128; excess accepted
+  connections are closed immediately.
 
 ## Commands
 
@@ -77,8 +79,8 @@ Module map (target, all under `src/`):
 |---|---|
 | `root.zig` | public API re-exports + test aggregator |
 | `main.zig` | demo: build an `Evented` `io`, run the server |
-| `http.zig` | `Method`/`Status`/`Request`/`Response` + parser + chunked decoder *(unchanged)* |
-| `websocket.zig` | RFC 6455 handshake + frame codec + `Assembler` *(unchanged)* |
+| `http.zig` | `Method`/`Status`/`Request`/`Response` + parser + chunked decoder |
+| `websocket.zig` | RFC 6455 handshake + frame codec + `Assembler` |
 | `connection.zig` | straight-line per-connection handler + `Config`/handler API |
 | `server.zig` | `std.Io.net` listen + accept loop + fiber-per-connection |
 
