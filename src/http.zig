@@ -394,6 +394,15 @@ pub const Response = struct {
 
     /// Emit the full response into `out`.
     pub fn serialize(self: *const Response, out: *std.ArrayList(u8), gpa: Allocator, keep_alive: bool) !void {
+        try self.serializeImpl(out, gpa, keep_alive, true);
+    }
+
+    /// Emit response headers for a HEAD request, preserving the body length.
+    pub fn serializeHead(self: *const Response, out: *std.ArrayList(u8), gpa: Allocator, keep_alive: bool) !void {
+        try self.serializeImpl(out, gpa, keep_alive, false);
+    }
+
+    fn serializeImpl(self: *const Response, out: *std.ArrayList(u8), gpa: Allocator, keep_alive: bool, include_body: bool) !void {
         var line: [64]u8 = undefined;
         const status_line = std.fmt.bufPrint(&line, "HTTP/1.1 {d} {s}\r\n", .{
             @intFromEnum(self.status), self.status.phrase(),
@@ -405,7 +414,7 @@ pub const Response = struct {
         try out.appendSlice(gpa, cl);
         try out.appendSlice(gpa, if (keep_alive) "Connection: keep-alive\r\n" else "Connection: close\r\n");
         try out.appendSlice(gpa, "\r\n");
-        try out.appendSlice(gpa, self.body_buf.items);
+        if (include_body) try out.appendSlice(gpa, self.body_buf.items);
     }
 };
 
@@ -590,6 +599,21 @@ test "Response.serialize close + empty body" {
     try res.serialize(&out, gpa, false);
     try testing.expectEqualStrings(
         "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        out.items,
+    );
+}
+
+test "Response.serializeHead preserves length without body" {
+    const gpa = testing.allocator;
+    var res = Response.init(gpa);
+    defer res.deinit();
+    try res.write("hello");
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    try res.serializeHead(&out, gpa, false);
+    try testing.expectEqualStrings(
+        "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\n",
         out.items,
     );
 }

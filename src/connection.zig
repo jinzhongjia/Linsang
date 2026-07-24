@@ -82,7 +82,10 @@ pub const Connection = struct {
                 switch (self.cfg.on_request(&self.req, &self.res, self.cfg.user_data)) {
                     .respond => {
                         const keep_alive = self.req.keep_alive;
-                        try self.res.serialize(&self.write_buf, self.gpa, keep_alive);
+                        if (self.req.method == .HEAD)
+                            try self.res.serializeHead(&self.write_buf, self.gpa, keep_alive)
+                        else
+                            try self.res.serialize(&self.write_buf, self.gpa, keep_alive);
                         self.consume(consumed);
                         try self.flush();
                         self.requests_served += 1;
@@ -138,10 +141,19 @@ pub const Connection = struct {
         if (head_len > self.cfg.read_buffer_size)
             return .{ .fail = .request_header_fields_too_large };
 
-        var consumed = head_len;
         if (self.req.content_length) |content_length| {
             if (content_length > self.cfg.max_body_size or content_length > std.math.maxInt(usize))
                 return .{ .fail = .payload_too_large };
+        }
+        if (self.req.expect_continue and
+            (self.req.chunked or (self.req.content_length orelse 0) > 0))
+        {
+            try self.write_buf.appendSlice(self.gpa, "HTTP/1.1 100 Continue\r\n\r\n");
+            try self.flush();
+        }
+
+        var consumed = head_len;
+        if (self.req.content_length) |content_length| {
             const body_len: usize = @intCast(content_length);
             const needed = std.math.add(usize, head_len, body_len) catch
                 return .{ .fail = .payload_too_large };
@@ -268,8 +280,14 @@ pub const Connection = struct {
         switch (self.ws_asm.push(frame)) {
             .incomplete => {},
             .fail => |code| self.wsClose(code, ""),
-            .message => |message| if (self.cfg.on_ws_message) |callback|
-                callback(self, message, self.cfg.user_data),
+            .message => |message| {
+                if (message.opcode == .text and !std.unicode.utf8ValidateSlice(message.data)) {
+                    self.wsClose(.invalid_payload, "");
+                    return;
+                }
+                if (self.cfg.on_ws_message) |callback|
+                    callback(self, message, self.cfg.user_data);
+            },
         }
     }
 
@@ -573,6 +591,39 @@ test "chunked body may arrive in pieces" {
     try group.await(io);
 }
 
+test "Expect continue and HEAD response semantics" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    var threaded = std.Io.Threaded.init(testing.allocator, .{ .async_limit = .unlimited });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const streams = try tcpPair(io);
+    const client = streams[0];
+    defer client.close(io);
+    const server = streams[1];
+    var cfg: Config = .{ .on_request = bodyHandler };
+    var group: std.Io.Group = .init;
+    group.async(io, runTestConnection, .{ io, server, &cfg });
+
+    try writeTest(client, io, "POST / HTTP/1.1\r\nExpect: 100-continue\r\nContent-Length: 3\r\n\r\n");
+    var response: [512]u8 = undefined;
+    const interim = try readUntil(client, io, &response, "\r\n\r\n");
+    try testing.expectEqualStrings("HTTP/1.1 100 Continue\r\n\r\n", interim);
+    try writeTest(client, io, "abc");
+    const posted = try readUntil(client, io, &response, "abc");
+    try testing.expect(std.mem.endsWith(u8, posted, "abc"));
+
+    try writeTest(client, io, "HEAD / HTTP/1.1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+    const head = try readUntil(client, io, &response, "\r\n\r\n");
+    try testing.expect(std.mem.indexOf(u8, head, "Content-Length: 0\r\n") != null);
+    var byte: [1]u8 = undefined;
+    var parts = [1][]u8{&byte};
+    try testing.expectEqual(
+        @as(usize, 0),
+        try io.vtable.netRead(io.userdata, client.socket.handle, &parts),
+    );
+    try group.await(io);
+}
+
 test "partial request times out with 408" {
     if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
     var threaded = std.Io.Threaded.init(testing.allocator, .{ .async_limit = .unlimited });
@@ -660,4 +711,9 @@ test "WebSocket upgrade and echo over std.Io.net" {
     var echoed: [4]u8 = undefined;
     try readExact(client, io, &echoed);
     try testing.expectEqualSlices(u8, &.{ 0x81, 2, 'H', 'i' }, &echoed);
+
+    try writeTest(client, io, &.{ 0x81, 0x81, 1, 2, 3, 4, 0xff ^ 1 });
+    var closed: [4]u8 = undefined;
+    try readExact(client, io, &closed);
+    try testing.expectEqualSlices(u8, &.{ 0x88, 2, 0x03, 0xef }, &closed);
 }
