@@ -15,6 +15,7 @@ pub const server = @import("server.zig");
 pub const Config = connection.Config;
 pub const Connection = connection.Connection;
 pub const Action = connection.Action;
+pub const StreamHandler = connection.StreamHandler;
 pub const Server = server.Server;
 
 pub const Request = http.Request;

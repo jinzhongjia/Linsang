@@ -80,7 +80,7 @@ reactor state machine:
 ```
 read into rbuf until parseHead → done | 431-on-overflow | fail-status
 read body (Content-Length slice, or decode chunked in place)
-dispatch handler → build response → write + flush
+dispatch handler → buffered response, streamed chunks, or WebSocket upgrade
 if keep-alive: reset and loop, else close
 on WebSocket upgrade: switch to a frame-read loop
 ```
@@ -98,8 +98,9 @@ This uses the pure protocol code in `http.zig` (`parseHead`, `decodeChunked`,
 - Fixed per-connection read buffer (default 8 KiB); headers over it → 431.
 - Bodies: `Content-Length` bodies are a zero-copy slice of the read buffer;
   chunked is decoded in place. Buffered up to `max_body_size` (default 1 MiB) → 413.
-- Response buffered, then written (`Content-Length`). Streaming responses are a
-  later enhancement (`// ponytail:`).
+- Responses may be buffered and written with `Content-Length`, or streamed one
+  chunk at a time. HTTP/1.1 streaming uses chunked framing; HTTP/1.0 streaming
+  closes the connection to delimit the body.
 - **Per-connection cost now also includes a fiber stack** (lazily committed).
   This is heavier than the previous state-machine-per-connection but was accepted
   in exchange for stdlib-tested networking and simpler code. Keep buffers bounded
@@ -113,9 +114,9 @@ This uses the pure protocol code in `http.zig` (`parseHead`, `decodeChunked`,
 ## HTTP/1.1
 
 Incremental request parser (request-line, headers, `Content-Length` + chunked),
-keep-alive (honor `Connection: close`), `Expect: 100-continue`, response builder
-(`Content-Length`). Out of scope (YAGNI): HTTP/2, pipelining, compression,
-multipart.
+keep-alive (honor `Connection: close`), `Expect: 100-continue`, buffered
+`Content-Length` responses and chunked streaming responses. Out of scope
+(YAGNI): HTTP/2, pipelining, compression, multipart.
 Static file serving = optional example handler, not core.
 
 ## WebSocket (RFC 6455)

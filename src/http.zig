@@ -359,10 +359,7 @@ fn parseHexSize(hex: []const u8) ?u64 {
 // Response builder
 // ---------------------------------------------------------------------------
 
-/// Buffers a response in memory, then serializes it with Content-Length.
-/// Streaming/chunked responses are a later enhancement.
-// ponytail: full-buffer response keeps the handler API trivial; add a streaming
-// writer only when someone needs to send bodies too big to hold.
+/// Builds response metadata and, for `.respond`, buffers a Content-Length body.
 pub const Response = struct {
     gpa: Allocator,
     status: Status = .ok,
@@ -405,31 +402,56 @@ pub const Response = struct {
 
     /// Emit the full response into `out`.
     pub fn serialize(self: *const Response, out: *std.ArrayList(u8), gpa: Allocator, keep_alive: bool) !void {
-        try self.serializeImpl(out, gpa, keep_alive, true);
+        try self.serializeImpl(out, gpa, keep_alive, true, .buffered);
     }
 
     /// Emit response headers for a HEAD request, preserving the body length.
     pub fn serializeHead(self: *const Response, out: *std.ArrayList(u8), gpa: Allocator, keep_alive: bool) !void {
-        try self.serializeImpl(out, gpa, keep_alive, false);
+        try self.serializeImpl(out, gpa, keep_alive, false, .buffered);
     }
 
-    fn serializeImpl(self: *const Response, out: *std.ArrayList(u8), gpa: Allocator, keep_alive: bool, include_body: bool) !void {
+    /// Emit headers for a streamed response. HTTP/1.1 uses chunked framing;
+    /// HTTP/1.0 is delimited by closing the connection.
+    pub fn serializeStream(self: *const Response, out: *std.ArrayList(u8), gpa: Allocator, keep_alive: bool, chunked: bool) !void {
+        try self.serializeImpl(out, gpa, keep_alive, false, if (chunked) .chunked else .close_delimited);
+    }
+
+    pub fn bodyAllowed(self: *const Response) bool {
+        const status_code = @intFromEnum(self.status);
+        return status_code >= 200 and self.status != .no_content and self.status != .not_modified;
+    }
+
+    const Framing = enum { buffered, chunked, close_delimited };
+
+    fn serializeImpl(
+        self: *const Response,
+        out: *std.ArrayList(u8),
+        gpa: Allocator,
+        keep_alive: bool,
+        include_body: bool,
+        framing: Framing,
+    ) !void {
         var line: [64]u8 = undefined;
         const status_code = @intFromEnum(self.status);
-        const body_forbidden = status_code < 200 or self.status == .no_content or self.status == .not_modified;
+        const body_allowed = self.bodyAllowed();
         const status_line = std.fmt.bufPrint(&line, "HTTP/1.1 {d} {s}\r\n", .{
             status_code, self.status.phrase(),
         }) catch unreachable;
         try out.appendSlice(gpa, status_line);
         try out.appendSlice(gpa, self.header_lines.items);
 
-        if (status_code >= 200 and self.status != .no_content) {
-            const cl = std.fmt.bufPrint(&line, "Content-Length: {d}\r\n", .{self.body_buf.items.len}) catch unreachable;
-            try out.appendSlice(gpa, cl);
+        switch (framing) {
+            .buffered => if (status_code >= 200 and self.status != .no_content) {
+                const cl = std.fmt.bufPrint(&line, "Content-Length: {d}\r\n", .{self.body_buf.items.len}) catch unreachable;
+                try out.appendSlice(gpa, cl);
+            },
+            .chunked => if (body_allowed)
+                try out.appendSlice(gpa, "Transfer-Encoding: chunked\r\n"),
+            .close_delimited => {},
         }
         try out.appendSlice(gpa, if (keep_alive) "Connection: keep-alive\r\n" else "Connection: close\r\n");
         try out.appendSlice(gpa, "\r\n");
-        if (include_body and !body_forbidden) try out.appendSlice(gpa, self.body_buf.items);
+        if (include_body and body_allowed) try out.appendSlice(gpa, self.body_buf.items);
     }
 };
 
@@ -638,6 +660,27 @@ test "Response.serializeHead preserves length without body" {
     try res.serializeHead(&out, gpa, false);
     try testing.expectEqualStrings(
         "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\n",
+        out.items,
+    );
+}
+
+test "Response.serializeStream selects chunked or close framing" {
+    const gpa = testing.allocator;
+    var res = Response.init(gpa);
+    defer res.deinit();
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    try res.serializeStream(&out, gpa, true, true);
+    try testing.expectEqualStrings(
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n",
+        out.items,
+    );
+
+    out.clearRetainingCapacity();
+    try res.serializeStream(&out, gpa, false, false);
+    try testing.expectEqualStrings(
+        "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n",
         out.items,
     );
 }

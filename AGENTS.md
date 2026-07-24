@@ -124,9 +124,9 @@ event coalescing. `std.Io.net` handles all of this now.
 
 ## Scope
 
-**In**: keep-alive, `Content-Length` + chunked (both directions), WebSocket
-handshake/framing/fragmentation/ping-pong-close.
-**Out**: HTTP/2, pipelining, compression, multipart, streaming response bodies.
+**In**: keep-alive, buffered + streaming responses, `Content-Length` + chunked
+(both directions), WebSocket handshake/framing/fragmentation/ping-pong-close.
+**Out**: HTTP/2, pipelining, compression, multipart.
 **Phase 2**: TLS 1.3 over a transport seam on `Stream`, built on `std.crypto`.
 
 ## Guardrails

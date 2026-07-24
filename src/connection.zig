@@ -7,7 +7,14 @@ const websocket = @import("websocket.zig");
 const Allocator = std.mem.Allocator;
 const Stream = std.Io.net.Stream;
 
-pub const Action = enum { respond, upgrade };
+/// Produces a streamed response body. Returning completes the body.
+pub const StreamHandler = *const fn (*const http.Request, *Connection, ?*anyopaque) anyerror!void;
+
+pub const Action = union(enum) {
+    respond,
+    stream: StreamHandler,
+    upgrade,
+};
 
 pub const Config = struct {
     address: []const u8 = "0.0.0.0",
@@ -46,6 +53,7 @@ pub const Connection = struct {
     requests_served: usize = 0,
     closing: bool = false,
     close_notified: bool = false,
+    stream_framing: enum { none, chunked, close_delimited } = .none,
 
     fn init(io: std.Io, stream: Stream, gpa: Allocator, cfg: *const Config) !Connection {
         if (cfg.read_buffer_size < 4) return error.InvalidConfiguration;
@@ -92,6 +100,9 @@ pub const Connection = struct {
                         self.requests_served += 1;
                         if (!keep_alive) return;
                     },
+                    .stream => |callback| {
+                        if (!try self.streamResponse(consumed, callback)) return;
+                    },
                     .upgrade => {
                         if (!try self.upgrade(consumed)) return;
                         return self.runWebSocket();
@@ -99,6 +110,32 @@ pub const Connection = struct {
                 }
             },
         };
+    }
+
+    fn streamResponse(self: *Connection, consumed: usize, callback: StreamHandler) !bool {
+        const body_allowed = self.req.method != .HEAD and self.res.bodyAllowed();
+        const chunked = self.req.minor_version >= 1;
+        const keep_alive = self.req.keep_alive and (chunked or !body_allowed);
+
+        try self.res.serializeStream(&self.write_buf, self.gpa, keep_alive, chunked);
+        try self.flush();
+
+        if (body_allowed) {
+            self.stream_framing = if (chunked) .chunked else .close_delimited;
+            defer self.stream_framing = .none;
+            try callback(&self.req, self, self.cfg.user_data);
+            if (chunked)
+                try timedWrite(
+                    self.io,
+                    self.stream,
+                    "0\r\n\r\n",
+                    durationTimeout(self.cfg.write_timeout),
+                );
+        }
+
+        self.consume(consumed);
+        self.requests_served += 1;
+        return keep_alive;
     }
 
     const ReadResult = union(enum) {
@@ -365,6 +402,30 @@ pub const Connection = struct {
         try websocket.writeText(&self.write_buf, self.gpa, data);
     }
 
+    /// Write and flush one response-body chunk. Only valid inside a `.stream`
+    /// callback; an empty chunk is ignored because completion is automatic.
+    pub fn writeChunk(self: *Connection, data: []const u8) !void {
+        switch (self.stream_framing) {
+            .none => return error.NotStreaming,
+            .close_delimited => if (data.len > 0)
+                try timedWrite(
+                    self.io,
+                    self.stream,
+                    data,
+                    durationTimeout(self.cfg.write_timeout),
+                ),
+            .chunked => {
+                if (data.len == 0) return;
+                var buffer: [2 * @sizeOf(usize) + 2]u8 = undefined;
+                const head = std.fmt.bufPrint(&buffer, "{x}\r\n", .{data.len}) catch unreachable;
+                const timeout = durationTimeout(self.cfg.write_timeout);
+                try timedWrite(self.io, self.stream, head, timeout);
+                try timedWrite(self.io, self.stream, data, timeout);
+                try timedWrite(self.io, self.stream, "\r\n", timeout);
+            },
+        }
+    }
+
     pub fn sendBinary(self: *Connection, data: []const u8) !void {
         try websocket.writeFrame(&self.write_buf, self.gpa, .binary, data, true);
     }
@@ -492,6 +553,16 @@ fn upgradeHandler(_: *const http.Request, _: *http.Response, _: ?*anyopaque) Act
     return .upgrade;
 }
 
+fn streamHandler(_: *const http.Request, _: *http.Response, _: ?*anyopaque) Action {
+    return .{ .stream = streamBody };
+}
+
+fn streamBody(_: *const http.Request, conn: *Connection, _: ?*anyopaque) !void {
+    try conn.writeChunk("Wiki");
+    try conn.writeChunk("");
+    try conn.writeChunk("pedia");
+}
+
 fn echoHandler(conn: *Connection, message: websocket.Message, _: ?*anyopaque) void {
     conn.sendText(message.data) catch {};
 }
@@ -590,6 +661,46 @@ test "chunked body may arrive in pieces" {
     const complete = try readUntil(client, io, &response, "Wikipedia");
     try testing.expect(std.mem.endsWith(u8, complete, "Wikipedia"));
     try group.await(io);
+}
+
+test "response streaming uses HTTP version framing" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    var threaded = std.Io.Threaded.init(testing.allocator, .{ .async_limit = .unlimited });
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const Case = struct {
+        request: []const u8,
+        terminator: []const u8,
+        expected: []const u8,
+    };
+    for ([_]Case{
+        .{
+            .request = "GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+            .terminator = "0\r\n\r\n",
+            .expected = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n" ++
+                "4\r\nWiki\r\n5\r\npedia\r\n0\r\n\r\n",
+        },
+        .{
+            .request = "GET / HTTP/1.0\r\n\r\n",
+            .terminator = "Wikipedia",
+            .expected = "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nWikipedia",
+        },
+    }) |case| {
+        const streams = try tcpPair(io);
+        const client = streams[0];
+        defer client.close(io);
+        const server = streams[1];
+        var cfg: Config = .{ .on_request = streamHandler };
+        var group: std.Io.Group = .init;
+        group.async(io, runTestConnection, .{ io, server, &cfg });
+
+        try writeTest(client, io, case.request);
+        var response: [256]u8 = undefined;
+        const complete = try readUntil(client, io, &response, case.terminator);
+        try testing.expectEqualStrings(case.expected, complete);
+        try group.await(io);
+    }
 }
 
 test "Expect continue and HEAD response semantics" {

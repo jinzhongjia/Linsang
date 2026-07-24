@@ -67,11 +67,20 @@ const linsang = @import("Linsang");
 fn onRequest(req: *const linsang.Request, res: *linsang.Response, ud: ?*anyopaque) linsang.Action {
     _ = ud;
     if (std.mem.eql(u8, req.path, "/ws")) return .upgrade; // hand off to WebSocket
+    if (std.mem.eql(u8, req.path, "/stream")) {
+        res.setHeader("Content-Type", "text/plain") catch {};
+        return .{ .stream = streamBody };
+    }
     res.status = .ok;
     res.setHeader("Content-Type", "text/plain") catch {};
     res.print("hello {s}", .{req.path}) catch {};
     return .respond;
 }
+
+fn streamBody(_: *const linsang.Request, conn: *linsang.Connection, _: ?*anyopaque) !void {
+    try conn.writeChunk("first\n");
+    try conn.writeChunk("second\n");
+} // the final chunk is written automatically
 
 fn onMessage(conn: *linsang.Connection, msg: linsang.websocket.Message, ud: ?*anyopaque) void {
     _ = ud;
@@ -114,8 +123,9 @@ a fiber; under Threaded it uses the runtime's thread pool.
 
 ## Scope
 
-**In:** HTTP/1.1 keep-alive, `Content-Length` + chunked bodies (both directions),
-WebSocket handshake + framing + fragmentation + ping/pong/close.
+**In:** HTTP/1.1 keep-alive, buffered and streaming responses, `Content-Length`
++ chunked bodies (both directions), WebSocket handshake + framing +
+fragmentation + ping/pong/close.
 
 **Out (by design):** HTTP/2, pipelining, compression, multipart. **TLS is a
 planned Phase 2** (TLS 1.3 over a transport seam on `Stream`, built on
