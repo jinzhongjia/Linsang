@@ -68,9 +68,14 @@ run_curl() {
     else
         tls_args="--tlsv1.3 --tls-max 1.3"
     fi
-    body=$(curl --silent --show-error --fail --insecure --http1.1 \
+    if ! body=$(curl --silent --show-error --fail --insecure --http1.1 \
+        --noproxy '*' --resolve "localhost:$port:127.0.0.1" \
         --connect-timeout 5 --max-time 10 $tls_args \
-        "https://localhost:$port/")
+        "https://localhost:$port/"); then
+        printf 'curl TLS %s failed with certificate %s\n' "$version" "$cert" >&2
+        sed -n '1,120p' "$server_log" >&2
+        return 1
+    fi
     [ "$body" = "interop ok" ]
     finish_server
 }
