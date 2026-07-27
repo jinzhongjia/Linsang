@@ -146,23 +146,32 @@ The `.files` action serves GET/HEAD below its opened directory. Directory URLs
 ending in `/` resolve to `index.html`; responses include a weak metadata ETag,
 support `If-None-Match`, and support one byte range per request.
 
-For managed lifetimes, `server.start(io)` returns a `Running` handle.
+For server-initiated WebSocket traffic, call `conn.peer()` inside
+`on_ws_open` and store the returned owned `WebSocketPeer`, not `*Connection`.
+Clone it when transferring ownership to another task and `deinit` every owned
+handle. `sendText`/`sendBinary` flush immediately, serialize concurrent frames,
+and return `error.Closed` or `error.Canceled` when disconnect races a send.
+
+For managed lifetimes, `try server.start(io)` binds synchronously and returns a
+`Running` handle. `running.address.getPort()` is therefore non-zero before the
+caller launches a dependent client when configured with port zero.
 `running.stop()` stops accepting, cancels active connections, and waits for
 their cleanup.
 
 ## Design
 
 See [docs/DESIGN.md](docs/DESIGN.md). In short: `IpAddress.listen(io)` → accept
-loop → one task per connection via `std.Io.Group`. A connection lives entirely
-inside its task, so there are no locks on the hot path. Under Evented the task is
-a fiber; under Threaded it uses the runtime's thread pool.
+loop → one task per connection via `std.Io.Group`. Ordinary connection state
+lives entirely inside its task; the optional outbound WebSocket handle uses one
+`std.Io.Mutex` to serialize frames. Under Evented the task is a fiber; under
+Threaded it uses the runtime's thread pool.
 
 ## Scope
 
 **In:** HTTP/1.1 keep-alive, buffered and streaming responses, `Content-Length`
 + chunked bodies (both directions), bounded-memory static file GET/HEAD with
 `index.html`, Range, and ETag, WebSocket handshake + framing + fragmentation +
-ping/pong/close, and TLS 1.2/1.3 server transport.
+ping/pong/close + task-safe outbound peers, and TLS 1.2/1.3 server transport.
 
 **Out (by design):** HTTP/2, pipelining, compression, multipart, TLS client
 mode, TLS session resumption, and mTLS. TLS advertises only `http/1.1` through

@@ -73,9 +73,10 @@ The library takes an `io: std.Io` and threads it through. Callers pick the runti
 
 Flow: `IpAddress.listen(io)` → loop `Server.accept(io)` → per `Stream`,
 `std.Io.Group.async(io, handleConn, …)`. Each connection lives in its own fiber
-(no locks). Blocking `read`/`write` suspends the fiber, not the thread. Handlers
-run in the fiber; they may block on `io` ops but must not make foreign OS-blocking
-calls.
+except for the optional outbound WebSocket peer, whose writes use `std.Io.Mutex`
+for serialization. Blocking `read`/`write` suspends the fiber, not the thread.
+Handlers run in the fiber; they may block on `io` ops but must not make foreign
+OS-blocking calls.
 
 Module map (target, all under `src/`):
 
@@ -132,7 +133,8 @@ event coalescing. `std.Io.net` handles all of this now.
 **In**: keep-alive, buffered + streaming responses, `Content-Length` + chunked
 (both directions), bounded-memory static file GET/HEAD with `index.html`,
 single-range requests, and ETag/304, WebSocket
-handshake/framing/fragmentation/ping-pong-close, TLS 1.2/1.3 server transport.
+handshake/framing/fragmentation/ping-pong-close plus task-safe outbound peers,
+synchronous bound-address discovery, TLS 1.2/1.3 server transport.
 **Out**: HTTP/2, pipelining, compression, multipart, TLS client mode, session
 resumption, early data, mTLS.
 

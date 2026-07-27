@@ -16,6 +16,7 @@ pub const server = @import("server.zig");
 pub const Config = connection.Config;
 pub const TlsConfig = connection.TlsConfig;
 pub const Connection = connection.Connection;
+pub const WebSocketPeer = connection.WebSocketPeer;
 pub const Action = connection.Action;
 pub const StreamHandler = connection.StreamHandler;
 pub const StaticFiles = connection.StaticFiles;

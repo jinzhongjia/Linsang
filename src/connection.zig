@@ -56,6 +56,81 @@ pub const Config = struct {
     user_data: ?*anyopaque = null,
 };
 
+/// Owned, thread-safe handle for server-initiated WebSocket messages.
+/// Call `deinit` when the handle is no longer needed; use `clone` when
+/// transferring ownership to another task.
+pub const WebSocketPeer = struct {
+    state: *State,
+
+    pub const SendError = error{ Closed, Canceled, InvalidUtf8 };
+
+    pub fn clone(self: WebSocketPeer) WebSocketPeer {
+        self.state.retain();
+        return self;
+    }
+
+    pub fn deinit(self: *WebSocketPeer) void {
+        const state = self.state;
+        self.* = undefined;
+        state.release();
+    }
+
+    pub fn sendText(self: WebSocketPeer, data: []const u8) SendError!void {
+        if (!std.unicode.utf8ValidateSlice(data)) return error.InvalidUtf8;
+        try self.sendFrame(.text, data);
+    }
+
+    pub fn sendBinary(self: WebSocketPeer, data: []const u8) SendError!void {
+        try self.sendFrame(.binary, data);
+    }
+
+    fn sendFrame(self: WebSocketPeer, opcode: websocket.Opcode, data: []const u8) SendError!void {
+        const state = self.state;
+        try state.mutex.lock(state.io);
+        defer state.mutex.unlock(state.io);
+        const connection = state.connection orelse return error.Closed;
+
+        var header_buffer: [10]u8 = undefined;
+        const header = websocket.frameHeader(&header_buffer, opcode, data.len, true);
+        timedWrite(
+            connection,
+            header,
+            durationTimeout(connection.cfg.write_timeout),
+        ) catch |err| return state.writeFailed(connection, err);
+        if (data.len > 0)
+            timedWrite(
+                connection,
+                data,
+                durationTimeout(connection.cfg.write_timeout),
+            ) catch |err| return state.writeFailed(connection, err);
+    }
+
+    const State = struct {
+        gpa: Allocator,
+        io: std.Io,
+        refs: std.atomic.Value(usize) = .init(1),
+        mutex: std.Io.Mutex = .init,
+        connection: ?*Connection,
+
+        fn retain(self: *State) void {
+            const previous = self.refs.fetchAdd(1, .monotonic);
+            std.debug.assert(previous > 0 and previous < std.math.maxInt(usize));
+        }
+
+        fn release(self: *State) void {
+            if (self.refs.fetchSub(1, .release) != 1) return;
+            _ = self.refs.load(.acquire);
+            self.gpa.destroy(self);
+        }
+
+        fn writeFailed(self: *State, connection: *Connection, err: anyerror) SendError {
+            self.connection = null;
+            connection.stream.shutdown(self.io, .both) catch {};
+            return if (err == error.Canceled) error.Canceled else error.Closed;
+        }
+    };
+};
+
 pub const Connection = struct {
     io: std.Io,
     stream: Stream,
@@ -72,6 +147,7 @@ pub const Connection = struct {
     close_notified: bool = false,
     stream_framing: enum { none, chunked, close_delimited } = .none,
     tls_connection: ?*tls.Connection = null,
+    ws_peer_state: ?*WebSocketPeer.State = null,
 
     fn init(io: std.Io, stream: Stream, gpa: Allocator, cfg: *const Config) !Connection {
         if (cfg.read_buffer_size < 4) return error.InvalidConfiguration;
@@ -87,6 +163,7 @@ pub const Connection = struct {
     }
 
     fn deinit(self: *Connection) void {
+        self.closePeer();
         self.ws_asm.deinit();
         self.res.deinit();
         self.write_buf.deinit(self.gpa);
@@ -392,6 +469,14 @@ pub const Connection = struct {
                 try websocket.writeAccept(&self.write_buf, self.gpa, key);
                 self.consume(consumed);
                 self.ws_asm.reset();
+                try self.flush();
+                const state = try self.gpa.create(WebSocketPeer.State);
+                state.* = .{
+                    .gpa = self.gpa,
+                    .io = self.io,
+                    .connection = self,
+                };
+                self.ws_peer_state = state;
                 if (self.cfg.on_ws_open) |callback| callback(self, self.cfg.user_data);
                 try self.flush();
                 return true;
@@ -411,7 +496,7 @@ pub const Connection = struct {
     }
 
     fn runWebSocket(self: *Connection) !void {
-        defer self.notifyClose();
+        defer self.closePeer();
         while (!self.closing) {
             switch (websocket.parseFrame(self.read_buf[0..self.read_len], true)) {
                 .done => |done| {
@@ -529,6 +614,23 @@ pub const Connection = struct {
 
     fn flush(self: *Connection) !void {
         if (self.write_buf.items.len == 0) return;
+        if (self.ws_peer_state) |state| {
+            try state.mutex.lock(self.io);
+            defer state.mutex.unlock(self.io);
+            if (state.connection != self) return error.Closed;
+            timedWrite(
+                self,
+                self.write_buf.items,
+                durationTimeout(self.cfg.write_timeout),
+            ) catch |err| {
+                state.connection = null;
+                self.stream.shutdown(self.io, .both) catch {};
+                return err;
+            };
+            self.write_buf.clearRetainingCapacity();
+            if (self.closing) state.connection = null;
+            return;
+        }
         try timedWrite(
             self,
             self.write_buf.items,
@@ -556,6 +658,29 @@ pub const Connection = struct {
         if (self.cfg.on_ws_close) |callback| callback(self, self.cfg.user_data);
     }
 
+    fn closePeer(self: *Connection) void {
+        const state = self.ws_peer_state orelse return;
+        self.ws_peer_state = null;
+        state.mutex.lockUncancelable(self.io);
+        if (state.connection == self) state.connection = null;
+        state.mutex.unlock(self.io);
+        self.notifyClose();
+        state.release();
+    }
+
+    /// Returns an owned outbound handle for this WebSocket connection.
+    /// Valid only after upgrade; the caller must eventually call `deinit`.
+    pub fn peer(self: *Connection) error{Closed}!WebSocketPeer {
+        const state = self.ws_peer_state orelse return error.Closed;
+        state.mutex.lockUncancelable(self.io);
+        defer state.mutex.unlock(self.io);
+        if (state.connection != self) return error.Closed;
+        state.retain();
+        return .{ .state = state };
+    }
+
+    /// Queue a text frame from a WebSocket callback. Use `peer()` when sending
+    /// from another task or when the frame must be flushed immediately.
     pub fn sendText(self: *Connection, data: []const u8) !void {
         try websocket.writeText(&self.write_buf, self.gpa, data);
     }
@@ -583,6 +708,8 @@ pub const Connection = struct {
         }
     }
 
+    /// Queue a binary frame from a WebSocket callback. Use `peer()` when sending
+    /// from another task or when the frame must be flushed immediately.
     pub fn sendBinary(self: *Connection, data: []const u8) !void {
         try websocket.writeFrame(&self.write_buf, self.gpa, .binary, data, true);
     }
@@ -925,6 +1052,7 @@ pub fn handle(io: std.Io, stream: Stream, gpa: Allocator, cfg: *const Config) !v
         );
         connection.tls_connection = &tls_connection;
         defer tls_connection.close() catch {};
+        defer connection.closePeer();
         return connection.run();
     }
     try connection.run();
@@ -996,6 +1124,43 @@ fn echoHandler(conn: *Connection, message: websocket.Message, _: ?*anyopaque) vo
     conn.sendText(message.data) catch {};
 }
 
+const PeerTestContext = struct {
+    peer: ?WebSocketPeer = null,
+    ready: std.atomic.Value(bool) = .init(false),
+    close_count: std.atomic.Value(usize) = .init(0),
+};
+
+fn capturePeer(conn: *Connection, data: ?*anyopaque) void {
+    const context: *PeerTestContext = @ptrCast(@alignCast(data.?));
+    context.peer = conn.peer() catch return;
+    context.ready.store(true, .release);
+}
+
+fn countPeerClose(_: *Connection, data: ?*anyopaque) void {
+    const context: *PeerTestContext = @ptrCast(@alignCast(data.?));
+    _ = context.close_count.fetchAdd(1, .monotonic);
+}
+
+fn waitForPeer(io: std.Io, context: *const PeerTestContext) !WebSocketPeer {
+    for (0..100) |_| {
+        if (context.ready.load(.acquire)) return context.peer.?;
+        try std.Io.sleep(io, .fromMilliseconds(1), .awake);
+    }
+    return error.Timeout;
+}
+
+fn sendOwnedPeerByte(owned_peer: WebSocketPeer, id: u8) WebSocketPeer.SendError!void {
+    var peer = owned_peer;
+    defer peer.deinit();
+    try peer.sendBinary(&.{id});
+}
+
+fn sendOwnedPeerPayload(owned_peer: WebSocketPeer, payload: []const u8) WebSocketPeer.SendError!void {
+    var peer = owned_peer;
+    defer peer.deinit();
+    try peer.sendBinary(payload);
+}
+
 fn runTestConnection(io: std.Io, stream: Stream, cfg: *const Config) std.Io.Cancelable!void {
     handle(io, stream, testing.allocator, cfg) catch |err| {
         if (err == error.Canceled) return error.Canceled;
@@ -1018,6 +1183,21 @@ fn readUntil(stream: Stream, io: std.Io, buffer: []u8, needle: []const u8) ![]u8
         len += n;
     }
     return buffer[0..len];
+}
+
+fn readReaderUntil(reader: *std.Io.Reader, buffer: []u8, needle: []const u8) ![]u8 {
+    var needed: usize = 1;
+    while (needed <= buffer.len) {
+        const available = try reader.peekGreedy(needed);
+        if (std.mem.indexOf(u8, available, needle)) |index| {
+            const len = index + needle.len;
+            @memcpy(buffer[0..len], available[0..len]);
+            reader.toss(len);
+            return buffer[0..len];
+        }
+        needed = available.len + 1;
+    }
+    return error.StreamTooLong;
 }
 
 fn readExact(stream: Stream, io: std.Io, buffer: []u8) !void {
@@ -1360,6 +1540,82 @@ test "TLS 1.2 and 1.3 serve HTTP through the same connection path" {
     try testing.expectError(error.Timeout, timeout_future.await(io));
 }
 
+test "outbound WebSocket peer writes through TLS while the reader is idle" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    var threaded = std.Io.Threaded.init(testing.allocator, .{ .async_limit = .unlimited });
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var auth = try tls.CertKeyPair.fromSlice(
+        testing.allocator,
+        io,
+        @embedFile("tls/testdata/server_cert.pem"),
+        @embedFile("tls/testdata/server_key.pem"),
+    );
+    defer auth.deinit(testing.allocator);
+
+    const streams = try tcpPair(io);
+    const client_stream = streams[0];
+    defer client_stream.close(io);
+    var context: PeerTestContext = .{};
+    defer if (context.peer) |*peer| peer.deinit();
+    var cfg: Config = .{
+        .ws_idle_timeout = null,
+        .on_request = upgradeHandler,
+        .on_ws_open = capturePeer,
+        .on_ws_close = countPeerClose,
+        .user_data = &context,
+        .tls = .{
+            .auth = &auth,
+            .cipher_suites = &.{.AES_128_GCM_SHA256},
+        },
+    };
+    var server_future = io.async(handle, .{
+        io,
+        streams[1],
+        testing.allocator,
+        &cfg,
+    });
+    defer server_future.cancel(io) catch {};
+
+    const Client = std.crypto.tls.Client;
+    var input_buffer: [Client.min_buffer_len]u8 = undefined;
+    var output_buffer: [Client.min_buffer_len]u8 = undefined;
+    var tls_read_buffer: [Client.min_buffer_len]u8 = undefined;
+    var tls_write_buffer: [Client.min_buffer_len]u8 = undefined;
+    var input = client_stream.reader(io, &input_buffer);
+    var output = client_stream.writer(io, &output_buffer);
+    var entropy: [Client.Options.entropy_len]u8 = undefined;
+    io.random(&entropy);
+    var client = try Client.init(&input.interface, &output.interface, .{
+        .host = .no_verification,
+        .ca = .no_verification,
+        .read_buffer = &tls_read_buffer,
+        .write_buffer = &tls_write_buffer,
+        .entropy = &entropy,
+        .realtime_now = std.Io.Clock.real.now(io),
+    });
+    try client.writer.writeAll("GET /ws HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\n" ++
+        "Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" ++
+        "Sec-WebSocket-Version: 13\r\n\r\n");
+    try client.writer.flush();
+    try output.interface.flush();
+
+    var handshake: [512]u8 = undefined;
+    const accepted = try readReaderUntil(&client.reader, &handshake, "\r\n\r\n");
+    try testing.expect(std.mem.startsWith(u8, accepted, "HTTP/1.1 101"));
+    const peer = try waitForPeer(io, &context);
+    try peer.sendText("tls");
+    var frame: [5]u8 = undefined;
+    try client.reader.readSliceAll(&frame);
+    try testing.expectEqualSlices(u8, "\x81\x03tls", &frame);
+
+    try client.end();
+    try output.interface.flush();
+    try server_future.await(io);
+    try testing.expectEqual(@as(usize, 1), context.close_count.load(.monotonic));
+}
+
 test "HTTP keep-alive and parse error over std.Io.net" {
     if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
     var threaded = std.Io.Threaded.init(testing.allocator, .{ .async_limit = .unlimited });
@@ -1594,4 +1850,79 @@ test "WebSocket upgrade and echo over std.Io.net" {
     var closed: [4]u8 = undefined;
     try readExact(client, io, &closed);
     try testing.expectEqualSlices(u8, &.{ 0x88, 2, 0x03, 0xef }, &closed);
+}
+
+test "outbound WebSocket peer sends immediately, serializes, and closes safely" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    var threaded = std.Io.Threaded.init(testing.allocator, .{ .async_limit = .unlimited });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const streams = try tcpPair(io);
+    const client = streams[0];
+    defer client.close(io);
+
+    var context: PeerTestContext = .{};
+    defer if (context.peer) |*peer| peer.deinit();
+    var cfg: Config = .{
+        .ws_idle_timeout = null,
+        .on_request = upgradeHandler,
+        .on_ws_open = capturePeer,
+        .on_ws_close = countPeerClose,
+        .user_data = &context,
+    };
+    var server_future = io.async(handle, .{
+        io,
+        streams[1],
+        testing.allocator,
+        &cfg,
+    });
+    defer server_future.cancel(io) catch {};
+
+    try writeTest(client, io, "GET /ws HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\n" ++
+        "Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" ++
+        "Sec-WebSocket-Version: 13\r\n\r\n");
+    var handshake: [256]u8 = undefined;
+    const accepted = try readUntil(client, io, &handshake, "\r\n\r\n");
+    try testing.expect(std.mem.startsWith(u8, accepted, "HTTP/1.1 101"));
+
+    const peer = try waitForPeer(io, &context);
+    try peer.sendText("idle");
+    var idle_frame: [6]u8 = undefined;
+    try readExact(client, io, &idle_frame);
+    try testing.expectEqualSlices(u8, "\x81\x04idle", &idle_frame);
+
+    const send_count = 16;
+    var sends: [send_count]std.Io.Future(WebSocketPeer.SendError!void) = undefined;
+    for (&sends, 0..) |*future, id|
+        future.* = io.async(sendOwnedPeerByte, .{ peer.clone(), @as(u8, @intCast(id)) });
+
+    var frames: [send_count * 3]u8 = undefined;
+    try readExact(client, io, &frames);
+    for (&sends) |*future| try future.await(io);
+    var seen = [_]bool{false} ** send_count;
+    for (0..send_count) |index| {
+        const frame = frames[index * 3 ..][0..3];
+        try testing.expectEqualSlices(u8, &.{ 0x82, 1 }, frame[0..2]);
+        try testing.expect(frame[2] < send_count);
+        try testing.expect(!seen[frame[2]]);
+        seen[frame[2]] = true;
+    }
+
+    const stress_count = 8;
+    var payload: [32 * 1024]u8 = undefined;
+    @memset(&payload, 0xa5);
+    var stress: [stress_count]std.Io.Future(WebSocketPeer.SendError!void) = undefined;
+    for (&stress) |*future|
+        future.* = io.async(sendOwnedPeerPayload, .{ peer.clone(), &payload });
+    try std.Io.sleep(io, .fromMilliseconds(1), .awake);
+    try client.shutdown(io, .both);
+    for (&stress) |*future| {
+        future.await(io) catch |err| switch (err) {
+            error.Closed, error.Canceled => {},
+            else => return err,
+        };
+    }
+    try server_future.await(io);
+    try testing.expectEqual(@as(usize, 1), context.close_count.load(.monotonic));
+    try testing.expectError(error.Closed, peer.sendText("late"));
 }

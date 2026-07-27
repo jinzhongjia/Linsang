@@ -54,10 +54,10 @@ implementation:
 
 Model: the server calls `IpAddress.listen(io, …)` then loops on `Server.accept(io)`;
 each accepted `Stream` is handed to a fiber via `std.Io.Group.async(io, handleConn, …)`.
-A connection lives entirely inside its fiber, so there is **no shared mutable
-state and no locks** on the hot path. With Evented, a `read`/`write` that would
-block **suspends the fiber** (not the OS thread), so thousands of connections
-share a small thread pool.
+A connection normally lives entirely inside its fiber. The optional outbound
+WebSocket peer is the only shared state and uses a `std.Io.Mutex` to serialize
+frames. With Evented, a `read`/`write` that would block **suspends the fiber**
+(not the OS thread), so thousands of connections share a small thread pool.
 
 Handlers run inside the connection fiber. They may freely perform `io`-based
 operations (those suspend the fiber); they must **not** make foreign OS-blocking
@@ -133,14 +133,21 @@ Upgrade handshake (`Sec-WebSocket-Accept` = base64(SHA-1(key+GUID))), frame
 parse/build, client-mask handling, text/binary + fragmentation reassembly
 (bounded), ping/pong/close. Protocol violations → close.
 
+`Connection.peer()` returns an owned, reference-counted `WebSocketPeer` for
+application tasks. Its `std.Io.Mutex` serializes callback, peer, and TLS writes;
+disconnect clears the connection pointer while holding that mutex, so storage
+cannot disappear during a send. Peer sends flush immediately and fail with
+`Closed` or `Canceled` after shutdown.
+
 ## Error handling (trust boundary — never simplified away)
 
 All socket input is untrusted: parse error → 400, header too big → 431, body too
 big → 413, bad method/version → 501/505, malformed WS → protocol-error close. No
 panics on bad input; a failed connection just ends its fiber and closes.
 
-`Server.start` returns a cancelable running handle. Stopping cancels accept,
-cancels the connection group, waits for task cleanup, and closes the listener.
+`Server.start` binds synchronously, then returns a cancelable running handle
+whose `address` includes the selected port. Stopping cancels accept, cancels the
+connection group, waits for task cleanup, and closes the listener.
 
 ## Module layout (target)
 

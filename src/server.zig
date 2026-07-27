@@ -24,10 +24,15 @@ pub const Server = struct {
         });
     }
 
-    pub fn start(self: *Server, io: std.Io) Running {
+    /// Bind synchronously, then serve in a background task. `Running.address`
+    /// contains the selected port before this function returns.
+    pub fn start(self: *Server, io: std.Io) !Running {
+        var listener = try self.listen(io);
+        errdefer listener.deinit(io);
         return .{
             .io = io,
-            .future = io.async(runAny, .{ self, io }),
+            .address = listener.socket.address,
+            .future = io.async(runBound, .{ self, io, listener }),
         };
     }
 
@@ -81,6 +86,9 @@ pub const Server = struct {
 
 pub const Running = struct {
     io: std.Io,
+    /// The actual listener address, including the selected port when configured
+    /// with port zero.
+    address: std.Io.net.IpAddress,
     future: std.Io.Future(anyerror!void),
 
     /// Stop accepting, cancel active connections, and wait for their cleanup.
@@ -96,8 +104,10 @@ pub const Running = struct {
     }
 };
 
-fn runAny(server: *Server, io: std.Io) anyerror!void {
-    try server.run(io);
+fn runBound(server: *Server, io: std.Io, bound_listener: NetServer) anyerror!void {
+    var listener = bound_listener;
+    defer listener.deinit(io);
+    try server.serve(io, &listener);
 }
 
 fn serveConnection(
@@ -197,7 +207,7 @@ test "listen and serve HTTP over std.Io.net TCP" {
     try group.await(io);
 }
 
-test "running server can be stopped cleanly" {
+test "start exposes the bound address and running server stops cleanly" {
     if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
     var threaded = std.Io.Threaded.init(testing.allocator, .{ .async_limit = .unlimited });
     defer threaded.deinit();
@@ -207,7 +217,21 @@ test "running server can be stopped cleanly" {
         .port = 0,
         .on_request = okHandler,
     });
-    var running = server.start(io);
+    var running = try server.start(io);
+    try testing.expect(running.address.getPort() != 0);
+
+    const client = try running.address.connect(io, .{ .mode = .stream });
+    defer client.close(io);
+    var write_buffer: [128]u8 = undefined;
+    var writer = client.writer(io, &write_buffer);
+    try writer.interface.writeAll(
+        "GET /bound HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+    );
+    try writer.interface.flush();
+    var response: [512]u8 = undefined;
+    var parts = [1][]u8{&response};
+    const received = try io.vtable.netRead(io.userdata, client.socket.handle, &parts);
+    try testing.expect(std.mem.indexOf(u8, response[0..received], "you asked for /bound") != null);
     try running.stop();
 }
 

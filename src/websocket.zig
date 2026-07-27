@@ -169,23 +169,28 @@ pub fn parseFrame(buf: []u8, require_mask: bool) FrameResult {
     return .{ .done = .{ .frame = .{ .fin = fin, .opcode = opcode, .payload = payload }, .consumed = pos + plen } };
 }
 
-/// Serialize a server->client frame (never masked) into `out`.
-pub fn writeFrame(out: *std.ArrayList(u8), gpa: Allocator, opcode: Opcode, payload: []const u8, fin: bool) !void {
-    var hdr: [10]u8 = undefined;
-    hdr[0] = (if (fin) @as(u8, 0x80) else 0) | @intFromEnum(opcode);
+/// Serialize a server-to-client frame header (never masked).
+pub fn frameHeader(buffer: *[10]u8, opcode: Opcode, payload_len: usize, fin: bool) []const u8 {
+    buffer[0] = (if (fin) @as(u8, 0x80) else 0) | @intFromEnum(opcode);
     var n: usize = 2;
-    if (payload.len < 126) {
-        hdr[1] = @intCast(payload.len);
-    } else if (payload.len <= 0xFFFF) {
-        hdr[1] = 126;
-        std.mem.writeInt(u16, hdr[2..4], @intCast(payload.len), .big);
+    if (payload_len < 126) {
+        buffer[1] = @intCast(payload_len);
+    } else if (payload_len <= 0xFFFF) {
+        buffer[1] = 126;
+        std.mem.writeInt(u16, buffer[2..4], @intCast(payload_len), .big);
         n = 4;
     } else {
-        hdr[1] = 127;
-        std.mem.writeInt(u64, hdr[2..10], payload.len, .big);
+        buffer[1] = 127;
+        std.mem.writeInt(u64, buffer[2..10], @intCast(payload_len), .big);
         n = 10;
     }
-    try out.appendSlice(gpa, hdr[0..n]);
+    return buffer[0..n];
+}
+
+/// Serialize a complete server-to-client frame (never masked).
+pub fn writeFrame(out: *std.ArrayList(u8), gpa: Allocator, opcode: Opcode, payload: []const u8, fin: bool) !void {
+    var header_buffer: [10]u8 = undefined;
+    try out.appendSlice(gpa, frameHeader(&header_buffer, opcode, payload.len, fin));
     try out.appendSlice(gpa, payload);
 }
 
