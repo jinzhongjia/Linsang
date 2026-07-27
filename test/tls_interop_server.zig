@@ -18,7 +18,9 @@ pub fn main(init: std.process.Init) !void {
         return error.InvalidArguments;
     }
 
-    const io = init.io;
+    var threaded = std.Io.Threaded.init(init.gpa, .{ .async_limit = .unlimited });
+    defer threaded.deinit();
+    const io = threaded.io();
     var auth = try linsang.tls.CertKeyPair.fromFilePath(
         init.gpa,
         io,
