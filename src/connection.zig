@@ -15,6 +15,9 @@ pub const StreamHandler = *const fn (*const http.Request, *Connection, ?*anyopaq
 /// path traversal are rejected.
 pub const StaticFiles = struct {
     dir: std.Io.Dir,
+    /// Called exactly once after this response no longer uses `dir`.
+    on_complete: ?*const fn (?*anyopaque) void = null,
+    user_data: ?*anyopaque = null,
 };
 
 pub const Action = union(enum) {
@@ -189,6 +192,7 @@ pub const Connection = struct {
                         if (!try self.streamResponse(consumed, callback)) return;
                     },
                     .files => |files| {
+                        defer if (files.on_complete) |callback| callback(files.user_data);
                         if (!try self.staticResponse(consumed, files)) return;
                     },
                     .upgrade => {
@@ -1092,6 +1096,18 @@ fn staticHandler(_: *const http.Request, _: *http.Response, user_data: ?*anyopaq
     return .{ .files = files.* };
 }
 
+const StaticCompletionContext = struct {
+    io: std.Io,
+    dir: std.Io.Dir,
+    calls: std.atomic.Value(usize) = .init(0),
+};
+
+fn closeCompletedStatic(user_data: ?*anyopaque) void {
+    const context: *StaticCompletionContext = @ptrCast(@alignCast(user_data.?));
+    context.dir.close(context.io);
+    _ = context.calls.fetchAdd(1, .monotonic);
+}
+
 fn staticTestRequest(
     io: std.Io,
     files: *const StaticFiles,
@@ -1451,6 +1467,53 @@ test "static files serve GET and HEAD and reject unsafe paths" {
     const body_start = (std.mem.indexOf(u8, not_modified, "\r\n\r\n") orelse
         return error.TestUnexpectedResult) + 4;
     try testing.expectEqual(@as(usize, 0), not_modified[body_start..].len);
+}
+
+test "static completion runs once after success and a missing-file error" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    var threaded = std.Io.Threaded.init(testing.allocator, .{ .async_limit = .unlimited });
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const public = try tmp.dir.createDirPathOpen(io, "public", .{});
+    try public.writeFile(io, .{
+        .sub_path = "index.html",
+        .data = "complete",
+    });
+
+    var context: StaticCompletionContext = .{
+        .io = io,
+        .dir = public,
+    };
+    var files: StaticFiles = .{
+        .dir = context.dir,
+        .on_complete = closeCompletedStatic,
+        .user_data = &context,
+    };
+    var response: [512]u8 = undefined;
+    const success = try staticTestRequest(
+        io,
+        &files,
+        "GET /index.html HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+        &response,
+        "complete",
+    );
+    try testing.expect(std.mem.endsWith(u8, success, "complete"));
+    try testing.expectEqual(@as(usize, 1), context.calls.load(.monotonic));
+
+    context.dir = try tmp.dir.openDir(io, "public", .{});
+    files.dir = context.dir;
+    const missing = try staticTestRequest(
+        io,
+        &files,
+        "GET /missing.txt HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+        &response,
+        "\r\n\r\n",
+    );
+    try testing.expect(std.mem.startsWith(u8, missing, "HTTP/1.1 404 Not Found\r\n"));
+    try testing.expectEqual(@as(usize, 2), context.calls.load(.monotonic));
 }
 
 test "TLS 1.2 and 1.3 serve HTTP through the same connection path" {

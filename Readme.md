@@ -144,7 +144,9 @@ Threaded cannot grow its worker pool without bound.
 
 The `.files` action serves GET/HEAD below its opened directory. Directory URLs
 ending in `/` resolve to `index.html`; responses include a weak metadata ETag,
-support `If-None-Match`, and support one byte range per request.
+support `If-None-Match`, and support one byte range per request. Its optional
+`on_complete(user_data)` runs exactly once after the response stops using the
+directory; directory ownership remains with the caller.
 
 For server-initiated WebSocket traffic, call `conn.peer()` inside
 `on_ws_open` and store the returned owned `WebSocketPeer`, not `*Connection`.

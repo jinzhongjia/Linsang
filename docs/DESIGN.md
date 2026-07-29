@@ -123,7 +123,8 @@ percent-decoded, traversal and symlinks are rejected, and files are copied in
 bounded chunks. Directory URLs ending in `/` resolve to `index.html`. Static
 responses include weak metadata ETags, honor `If-None-Match`, and support a
 single byte range with 206/416 responses. Generated directory listings and
-multipart byte ranges remain out of scope.
+multipart byte ranges remain out of scope. `StaticFiles.on_complete` provides an
+exactly-once lifecycle boundary after a response stops using its directory.
 
 Also out of scope (YAGNI): HTTP/2, pipelining, compression, multipart.
 
