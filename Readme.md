@@ -134,6 +134,9 @@ pub fn main() !void {
 
 `CertKeyPair` verifies that the private key matches the leaf certificate while
 loading, before the server starts accepting TLS connections.
+TLS readers may wrap immutable ciphertext. `Connection.next()` decrypts into
+bounded connection-owned storage rather than modifying the reader's input;
+its returned slice remains valid until the next read or next call.
 
 `Config` knobs: `tls`, `read_buffer_size`, `max_body_size`, `max_ws_message_size`,
 `request_timeout`, `keep_alive_timeout`, `write_timeout`, `backlog`, `max_connections`,

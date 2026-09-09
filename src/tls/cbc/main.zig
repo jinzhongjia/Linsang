@@ -74,10 +74,8 @@ pub fn CBC(comptime BlockCipher: anytype) type {
         /// IV must be secret, unpredictable and match the one used for encryption.
         pub fn decrypt(self: Self, dst: []u8, src: []const u8, iv: [DecryptCtx.block_length]u8) !void {
             const block_length = DecryptCtx.block_length;
-            if (src.len != dst.len) {
+            if (src.len != dst.len or src.len == 0 or src.len % block_length != 0)
                 return error.EncodingError;
-            }
-            debug.assert(src.len % block_length == 0);
             var i: usize = 0;
             var cv = iv;
             var out: [block_length]u8 = undefined;
@@ -145,4 +143,13 @@ test "CBC mode" {
     }
     h.final(&res);
     try std.testing.expectEqualSlices(u8, expected, &res);
+}
+
+test "CBC rejects truncated ciphertext without writing past a block" {
+    const M = CBC(aes.Aes128);
+    const key: [16]u8 = @splat(0);
+    const iv: [16]u8 = @splat(0);
+    var short: [15]u8 = undefined;
+    try std.testing.expectError(error.EncodingError, M.init(key).decrypt(&short, &short, iv));
+    try std.testing.expectError(error.EncodingError, M.init(key).decrypt(&.{}, &.{}, iv));
 }

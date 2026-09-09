@@ -24,6 +24,9 @@ pub const Connection = struct {
     close_alert: proto.Alert = .close_notify,
     /// Part of the cleartext record returned from next but not yet read by client.
     cleartext_buf: []const u8 = &.{},
+    /// Reader data may be immutable (for example Io.Reader.fixed). Keep bounded
+    /// writable storage when next() or a small caller buffer needs a full record.
+    record_storage: [cipher.max_ciphertext_record_len]u8 = undefined,
 
     /// ALPN protocol negotiated during TLS handshake (e.g., "h2", "http/1.1").
     /// Points into static data or the options slice; valid for the connection lifetime.
@@ -77,9 +80,8 @@ pub const Connection = struct {
         };
     }
 
-    /// Decrypt next tls record into buffer, if buffer is not big enough reuse
-    /// input ciphertext buffer for cleartext. Returns cleartext of the next tls
-    /// record.
+    /// Decrypt into the caller's buffer when large enough, otherwise into owned
+    /// record storage. Returned data is valid until the next read/next call.
     fn nextRecord(c: *Self, buffer: []u8) ![]const u8 {
         assert(c.cleartext_buf.len == 0);
         if (@atomicLoad(bool, &c.received_close_notify, .monotonic)) return error.EndOfStream;
@@ -87,13 +89,7 @@ pub const Connection = struct {
             const rec = try Record.read(c.input);
             if (rec.protocol_version != .tls_1_2) return error.TlsBadVersion;
 
-            // If provided buffer is not big enough reuse input buffer for
-            // cleartext. `rec.header` and `rec.payload`(ciphertext) are
-            // pointing somewhere in this buffer. Decrypter is first reading
-            // then writing a block, cleartext has less length then ciphertext,
-            // cleartext starts from the beginning of the buffer, so ciphertext
-            // is always ahead of cleartext.
-            const cleartext_buf = if (buffer.len >= rec.payload.len) buffer else @constCast(rec.buffer);
+            const cleartext_buf = if (buffer.len >= rec.payload.len) buffer else &c.record_storage;
             const content_type, const cleartext = try c.cipher.decrypt(cleartext_buf, rec);
 
             switch (content_type) {
