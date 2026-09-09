@@ -986,9 +986,9 @@ fn timedRead(
     if (bounded == .none) return transportRead(connection, buffer);
     var results: [2]ReadRace = undefined;
     var select = std.Io.Select(ReadRace).init(connection.io, &results);
-    select.async(.io, transportRead, .{ connection, buffer });
-    select.async(.timeout, waitTimeout, .{ connection.io, bounded });
     defer select.cancelDiscard();
+    try select.concurrent(.io, transportRead, .{ connection, buffer });
+    try select.concurrent(.timeout, waitTimeout, .{ connection.io, bounded });
     return switch (try select.await()) {
         .io => |result| try result,
         .timeout => |result| {
@@ -1023,9 +1023,9 @@ fn timedWrite(
     if (bounded == .none) return transportWrite(connection, bytes);
     var results: [2]WriteRace = undefined;
     var select = std.Io.Select(WriteRace).init(connection.io, &results);
-    select.async(.io, transportWrite, .{ connection, bytes });
-    select.async(.timeout, waitTimeout, .{ connection.io, bounded });
     defer select.cancelDiscard();
+    try select.concurrent(.io, transportWrite, .{ connection, bytes });
+    try select.concurrent(.timeout, waitTimeout, .{ connection.io, bounded });
     switch (try select.await()) {
         .io => |result| try result,
         .timeout => |result| {
@@ -1063,9 +1063,9 @@ fn tlsServerWithTimeout(
     if (timeout == .none) return tls.server(input, output, options);
     var results: [2]TlsHandshakeRace = undefined;
     var select = std.Io.Select(TlsHandshakeRace).init(io, &results);
-    select.async(.io, tls.server, .{ input, output, options });
-    select.async(.timeout, waitTimeout, .{ io, timeout });
     defer select.cancelDiscard();
+    try select.concurrent(.io, tls.server, .{ input, output, options });
+    try select.concurrent(.timeout, waitTimeout, .{ io, timeout });
     return switch (try select.await()) {
         .io => |result| try result,
         .timeout => |result| {

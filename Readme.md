@@ -33,6 +33,10 @@ The library takes an `io: std.Io` and threads it through. Callers choose:
   **Windows → not available**.
 - **`std.Io.Threaded`** — thread-pool blocking; the **required fallback on Windows**.
 
+Listener startup and I/O/deadline races use required `std.Io.concurrent`, not
+opportunistic `async`, which is allowed to run inline when its worker limit is
+reached. Correctness therefore does not require an unlimited async pool.
+
 A blocking `read`/`write` suspends the connection's fiber, not the OS thread, so
 many connections share a small thread pool. Fibers are supported on `x86_64`,
 `aarch64`, `riscv64`.
