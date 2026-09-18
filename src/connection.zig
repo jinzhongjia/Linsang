@@ -15,6 +15,9 @@ pub const StreamHandler = *const fn (*const http.Request, *Connection, ?*anyopaq
 /// path traversal are rejected.
 pub const StaticFiles = struct {
     dir: std.Io.Dir,
+    /// Optional already-decoded relative path, still validated below `dir`.
+    /// Retain this slice until on_complete; percent escapes are not decoded again.
+    canonical_path: ?[]const u8 = null,
     /// Called exactly once after this response no longer uses `dir`.
     on_complete: ?*const fn (?*anyopaque) void = null,
     user_data: ?*anyopaque = null,
@@ -53,6 +56,8 @@ pub const Config = struct {
     tls: ?TlsConfig = null,
 
     on_request: *const fn (*const http.Request, *http.Response, ?*anyopaque) Action,
+    /// The upgrade request in Connection.req is valid during this callback only.
+    /// Copy any route/authorization metadata needed by subsequent messages.
     on_ws_open: ?*const fn (*Connection, ?*anyopaque) void = null,
     on_ws_message: ?*const fn (*Connection, websocket.Message, ?*anyopaque) void = null,
     on_ws_close: ?*const fn (*Connection, ?*anyopaque) void = null,
@@ -151,6 +156,8 @@ pub const Connection = struct {
     stream_framing: enum { none, chunked, close_delimited } = .none,
     tls_connection: ?*tls.Connection = null,
     ws_peer_state: ?*WebSocketPeer.State = null,
+    /// Mutate only through setWebSocketDeadline from connection callbacks.
+    websocket_deadline: ?std.Io.Clock.Timestamp = null,
 
     fn init(io: std.Io, stream: Stream, gpa: Allocator, cfg: *const Config) !Connection {
         if (cfg.read_buffer_size < 4) return error.InvalidConfiguration;
@@ -163,6 +170,31 @@ pub const Connection = struct {
             .res = http.Response.init(gpa),
             .ws_asm = websocket.Assembler.init(gpa, cfg.max_ws_message_size),
         };
+    }
+
+    /// An absolute application deadline, unaffected by WebSocket control traffic.
+    /// Call only from on_ws_open/on_ws_message; null resumes the configured idle policy.
+    pub fn setWebSocketDeadline(self: *Connection, deadline: ?std.Io.Clock.Timestamp) void {
+        if (self.ws_peer_state) |state| {
+            state.mutex.lockUncancelable(self.io);
+            defer state.mutex.unlock(self.io);
+            self.websocket_deadline = deadline;
+        } else {
+            self.websocket_deadline = deadline;
+        }
+    }
+
+    fn boundedTimeout(self: *const Connection, timeout: std.Io.Timeout) std.Io.Timeout {
+        const deadline = self.websocket_deadline orelse return timeout;
+        if (timeout.toTimestamp(self.io)) |limit| {
+            const earlier = if (limit.clock == deadline.clock)
+                limit.compare(.lt, deadline)
+            else
+                limit.durationFromNow(self.io).raw.nanoseconds <
+                    deadline.durationFromNow(self.io).raw.nanoseconds;
+            if (earlier) return .{ .deadline = limit };
+        }
+        return .{ .deadline = deadline };
     }
 
     fn deinit(self: *Connection) void {
@@ -228,10 +260,10 @@ pub const Connection = struct {
             self.res.status = .not_found;
             return self.bufferedResponse(consumed);
         }
-        const encoded_path = raw_path[1..];
+        const encoded_path = files.canonical_path orelse raw_path[1..];
         const path_buffer = try self.gpa.alloc(u8, encoded_path.len + static_index.len);
         defer self.gpa.free(path_buffer);
-        const path = decodeStaticPath(path_buffer, encoded_path) orelse {
+        const path = staticPath(path_buffer, encoded_path, files.canonical_path == null) orelse {
             self.res.status = .not_found;
             return self.bufferedResponse(consumed);
         };
@@ -471,7 +503,6 @@ pub const Connection = struct {
         switch (websocket.checkUpgrade(&self.req)) {
             .yes => |key| {
                 try websocket.writeAccept(&self.write_buf, self.gpa, key);
-                self.consume(consumed);
                 self.ws_asm.reset();
                 try self.flush();
                 const state = try self.gpa.create(WebSocketPeer.State);
@@ -482,6 +513,7 @@ pub const Connection = struct {
                 };
                 self.ws_peer_state = state;
                 if (self.cfg.on_ws_open) |callback| callback(self, self.cfg.user_data);
+                self.consume(consumed);
                 try self.flush();
                 return true;
             },
@@ -502,6 +534,13 @@ pub const Connection = struct {
     fn runWebSocket(self: *Connection) !void {
         defer self.closePeer();
         while (!self.closing) {
+            if (self.websocket_deadline) |deadline| {
+                if (deadline.compare(.lte, .now(self.io, deadline.clock))) {
+                    self.wsClose(.going_away, "");
+                    self.flush() catch {};
+                    return;
+                }
+            }
             switch (websocket.parseFrame(self.read_buf[0..self.read_len], true)) {
                 .done => |done| {
                     self.handleFrame(done.frame);
@@ -727,11 +766,15 @@ pub const Connection = struct {
 const static_index = "index.html";
 
 fn decodeStaticPath(buffer: []u8, encoded: []const u8) ?[]u8 {
+    return staticPath(buffer, encoded, true);
+}
+
+fn staticPath(buffer: []u8, encoded: []const u8, decode: bool) ?[]u8 {
     if (buffer.len < encoded.len + static_index.len) return null;
     var read: usize = 0;
     var write: usize = 0;
     while (read < encoded.len) {
-        const byte = if (encoded[read] == '%') byte: {
+        const byte = if (decode and encoded[read] == '%') byte: {
             if (encoded.len - read < 3) return null;
             const value = std.fmt.parseInt(u8, encoded[read + 1 .. read + 3], 16) catch
                 return null;
@@ -939,12 +982,13 @@ fn timedRead(
     buffer: []u8,
     timeout: std.Io.Timeout,
 ) !usize {
-    if (timeout == .none) return transportRead(connection, buffer);
+    const bounded = connection.boundedTimeout(timeout);
+    if (bounded == .none) return transportRead(connection, buffer);
     var results: [2]ReadRace = undefined;
     var select = std.Io.Select(ReadRace).init(connection.io, &results);
-    select.async(.io, transportRead, .{ connection, buffer });
-    select.async(.timeout, waitTimeout, .{ connection.io, timeout });
     defer select.cancelDiscard();
+    try select.concurrent(.io, transportRead, .{ connection, buffer });
+    try select.concurrent(.timeout, waitTimeout, .{ connection.io, bounded });
     return switch (try select.await()) {
         .io => |result| try result,
         .timeout => |result| {
@@ -975,12 +1019,13 @@ fn timedWrite(
     bytes: []const u8,
     timeout: std.Io.Timeout,
 ) !void {
-    if (timeout == .none) return transportWrite(connection, bytes);
+    const bounded = connection.boundedTimeout(timeout);
+    if (bounded == .none) return transportWrite(connection, bytes);
     var results: [2]WriteRace = undefined;
     var select = std.Io.Select(WriteRace).init(connection.io, &results);
-    select.async(.io, transportWrite, .{ connection, bytes });
-    select.async(.timeout, waitTimeout, .{ connection.io, timeout });
     defer select.cancelDiscard();
+    try select.concurrent(.io, transportWrite, .{ connection, bytes });
+    try select.concurrent(.timeout, waitTimeout, .{ connection.io, bounded });
     switch (try select.await()) {
         .io => |result| try result,
         .timeout => |result| {
@@ -1018,9 +1063,9 @@ fn tlsServerWithTimeout(
     if (timeout == .none) return tls.server(input, output, options);
     var results: [2]TlsHandshakeRace = undefined;
     var select = std.Io.Select(TlsHandshakeRace).init(io, &results);
-    select.async(.io, tls.server, .{ input, output, options });
-    select.async(.timeout, waitTimeout, .{ io, timeout });
     defer select.cancelDiscard();
+    try select.concurrent(.io, tls.server, .{ input, output, options });
+    try select.concurrent(.timeout, waitTimeout, .{ io, timeout });
     return switch (try select.await()) {
         .io => |result| try result,
         .timeout => |result| {
@@ -1988,4 +2033,138 @@ test "outbound WebSocket peer sends immediately, serializes, and closes safely" 
     try server_future.await(io);
     try testing.expectEqual(@as(usize, 1), context.close_count.load(.monotonic));
     try testing.expectError(error.Closed, peer.sendText("late"));
+}
+
+fn reportUpgradePath(connection: *Connection, _: ?*anyopaque) void {
+    connection.sendText(connection.req.path) catch {};
+}
+
+test "upgrade callback retains authorized path with pipelined first frame" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{ .async_limit = .unlimited });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const streams = try tcpPair(io);
+    defer streams[0].close(io);
+    const cfg: Config = .{
+        .on_request = upgradeHandler,
+        .on_ws_open = reportUpgradePath,
+        .on_ws_message = echoHandler,
+        .ws_idle_timeout = .fromSeconds(1),
+    };
+    var serving = io.async(handle, .{ io, streams[1], testing.allocator, &cfg });
+    defer serving.cancel(io) catch {};
+    try writeTest(streams[0], io, "GET /authorized HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\n" ++
+        "Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" ++
+        "Sec-WebSocket-Version: 13\r\n\r\n" ++
+        "\x81\x82\x01\x02\x03\x04\x49\x6b");
+    var response: [512]u8 = undefined;
+    const received = try readUntil(streams[0], io, &response, "\x81\x02Hi");
+    try testing.expect(std.mem.indexOf(u8, received, "\x81\x0b/authorized") != null);
+}
+
+fn deadlineOnOpen(connection: *Connection, _: ?*anyopaque) void {
+    connection.setWebSocketDeadline(.fromNow(connection.io, .{
+        .clock = .awake,
+        .raw = .fromMilliseconds(200),
+    }));
+}
+
+fn clearDeadlineOnMessage(connection: *Connection, message: websocket.Message, _: ?*anyopaque) void {
+    connection.setWebSocketDeadline(null);
+    connection.sendText(message.data) catch {};
+}
+
+test "application WebSocket deadline cannot be renewed by control traffic" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{ .async_limit = .unlimited });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const streams = try tcpPair(io);
+    defer streams[0].close(io);
+    const cfg: Config = .{
+        .on_request = upgradeHandler,
+        .on_ws_open = deadlineOnOpen,
+        .ws_idle_timeout = .fromSeconds(1),
+    };
+    var serving = io.async(handle, .{ io, streams[1], testing.allocator, &cfg });
+    defer serving.cancel(io) catch {};
+    try writeTest(streams[0], io, "GET /ws HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\n" ++
+        "Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" ++
+        "Sec-WebSocket-Version: 13\r\n\r\n");
+    var response: [256]u8 = undefined;
+    _ = try readUntil(streams[0], io, &response, "\r\n\r\n");
+    var expired = false;
+    for (0..100) |_| {
+        writeTest(streams[0], io, "\x89\x80\x01\x02\x03\x04") catch {
+            expired = true;
+            break;
+        };
+        var header: [2]u8 = undefined;
+        readExact(streams[0], io, &header) catch |err| {
+            if (err != error.EndOfStream) return err;
+            expired = true;
+            break;
+        };
+        if (header[0] == 0x88) {
+            expired = true;
+            break;
+        }
+        try testing.expectEqualSlices(u8, "\x8a\x00", &header);
+        try std.Io.sleep(io, .fromMilliseconds(10), .awake);
+    }
+    try testing.expect(expired);
+}
+
+test "authenticated applications can clear the absolute WebSocket deadline" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{ .async_limit = .unlimited });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const streams = try tcpPair(io);
+    defer streams[0].close(io);
+    const cfg: Config = .{
+        .on_request = upgradeHandler,
+        .on_ws_open = deadlineOnOpen,
+        .on_ws_message = clearDeadlineOnMessage,
+        .ws_idle_timeout = .fromSeconds(1),
+    };
+    var serving = io.async(handle, .{ io, streams[1], testing.allocator, &cfg });
+    defer serving.cancel(io) catch {};
+    try writeTest(streams[0], io, "GET /ws HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\n" ++
+        "Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" ++
+        "Sec-WebSocket-Version: 13\r\n\r\n");
+    var response: [256]u8 = undefined;
+    _ = try readUntil(streams[0], io, &response, "\r\n\r\n");
+    try writeTest(streams[0], io, "\x81\x82\x01\x02\x03\x04\x49\x6b");
+    var echoed: [4]u8 = undefined;
+    try readExact(streams[0], io, &echoed);
+    try testing.expectEqualSlices(u8, "\x81\x02Hi", &echoed);
+    try std.Io.sleep(io, .fromMilliseconds(300), .awake);
+    try writeTest(streams[0], io, "\x81\x82\x01\x02\x03\x04\x49\x6b");
+    try readExact(streams[0], io, &echoed);
+    try testing.expectEqualSlices(u8, "\x81\x02Hi", &echoed);
+}
+
+test "canonical static paths are not decoded twice and remain contained" {
+    var buffer: [256]u8 = undefined;
+    try testing.expectEqualStrings("literal%2ejs", staticPath(&buffer, "literal%2ejs", false).?);
+    try testing.expect(staticPath(&buffer, "../secret", false) == null);
+    try testing.expect(staticPath(&buffer, "/absolute", false) == null);
+    try testing.expect(staticPath(&buffer, "nul\x00name", false) == null);
+    var threaded = std.Io.Threaded.init(testing.allocator, .{ .async_limit = .unlimited });
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "literal%2ejs", .data = "canonical-file" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "literal.js", .data = "wrong-file" });
+    const files: StaticFiles = .{ .dir = tmp.dir, .canonical_path = "literal%2ejs" };
+    var response: [1024]u8 = undefined;
+    const received = try staticTestRequest(
+        io,
+        &files,
+        "GET /ignored HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+        &response,
+        "canonical-file",
+    );
+    try testing.expect(std.mem.indexOf(u8, received, "canonical-file") != null);
+    try testing.expect(std.mem.indexOf(u8, received, "wrong-file") == null);
 }

@@ -32,7 +32,7 @@ pub const Server = struct {
         return .{
             .io = io,
             .address = listener.socket.address,
-            .future = io.async(runBound, .{ self, io, listener }),
+            .future = try io.concurrent(runBound, .{ self, io, listener }),
         };
     }
 
@@ -73,13 +73,16 @@ pub const Server = struct {
                 stream.close(io);
                 continue;
             }
-            connections.async(io, serveLimitedConnection, .{
+            connections.concurrent(io, serveLimitedConnection, .{
                 io,
                 stream,
                 self.gpa,
                 &self.config,
                 &active,
-            });
+            }) catch {
+                _ = active.fetchSub(1, .monotonic);
+                stream.close(io);
+            };
         }
     }
 };
@@ -208,8 +211,8 @@ test "listen and serve HTTP over std.Io.net TCP" {
 }
 
 test "start exposes the bound address and running server stops cleanly" {
-    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
-    var threaded = std.Io.Threaded.init(testing.allocator, .{ .async_limit = .unlimited });
+    // Async may legally run inline; the listener and deadline races must not.
+    var threaded = std.Io.Threaded.init(testing.allocator, .{ .async_limit = .nothing });
     defer threaded.deinit();
     const io = threaded.io();
     var server = Server.init(testing.allocator, .{

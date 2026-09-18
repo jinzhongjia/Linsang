@@ -33,6 +33,10 @@ The library takes an `io: std.Io` and threads it through. Callers choose:
   **Windows → not available**.
 - **`std.Io.Threaded`** — thread-pool blocking; the **required fallback on Windows**.
 
+Listener startup and I/O/deadline races use required `std.Io.concurrent`, not
+opportunistic `async`, which is allowed to run inline when its worker limit is
+reached. Correctness therefore does not require an unlimited async pool.
+
 A blocking `read`/`write` suspends the connection's fiber, not the OS thread, so
 many connections share a small thread pool. Fibers are supported on `x86_64`,
 `aarch64`, `riscv64`.
@@ -134,6 +138,9 @@ pub fn main() !void {
 
 `CertKeyPair` verifies that the private key matches the leaf certificate while
 loading, before the server starts accepting TLS connections.
+TLS readers may wrap immutable ciphertext. `Connection.next()` decrypts into
+bounded connection-owned storage rather than modifying the reader's input;
+its returned slice remains valid until the next read or next call.
 
 `Config` knobs: `tls`, `read_buffer_size`, `max_body_size`, `max_ws_message_size`,
 `request_timeout`, `keep_alive_timeout`, `write_timeout`, `backlog`, `max_connections`,
@@ -147,12 +154,23 @@ ending in `/` resolve to `index.html`; responses include a weak metadata ETag,
 support `If-None-Match`, and support one byte range per request. Its optional
 `on_complete(user_data)` runs exactly once after the response stops using the
 directory; directory ownership remains with the caller.
+`StaticFiles.canonical_path` optionally supplies an already-decoded relative
+resource path. It is still checked for traversal and forbidden bytes but is
+not percent-decoded again. Keep the slice alive through `on_complete`.
 
 For server-initiated WebSocket traffic, call `conn.peer()` inside
 `on_ws_open` and store the returned owned `WebSocketPeer`, not `*Connection`.
 Clone it when transferring ownership to another task and `deinit` every owned
 handle. `sendText`/`sendBinary` flush immediately, serialize concurrent frames,
 and return `error.Closed` or `error.Canceled` when disconnect races a send.
+
+`conn.req` remains valid during `on_ws_open`, including when the first
+WebSocket frame arrived with the upgrade request. Copy any authorization or
+route identity needed later; request slices expire when the callback returns.
+From connection callbacks, `conn.setWebSocketDeadline(deadline)` installs an
+absolute application deadline that also bounds control-frame processing and
+reads/writes. Clear it with `null` after authentication to resume
+`Config.ws_idle_timeout`. Mutate it through the setter, not the backing field.
 
 For managed lifetimes, `try server.start(io)` binds synchronously and returns a
 `Running` handle. `running.address.getPort()` is therefore non-zero before the

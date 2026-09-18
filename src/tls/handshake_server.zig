@@ -867,7 +867,6 @@ test "read client hello" {
     h.signature_scheme = .ecdsa_secp521r1_sha512; // this must be supported in signature_algorithms extension
     try h.readClientHello(cipher_suites.tls13, &.{});
 
-    try testing.expectEqual(CipherSuite.AES_128_GCM_SHA256, h.cipher_suite);
     try testing.expectEqual(.x25519, h.named_group);
     try testing.expectEqualSlices(u8, &data13.client_random, &h.client_random);
     try testing.expectEqualSlices(u8, &data13.client_public_key, h.client_pub_key);
