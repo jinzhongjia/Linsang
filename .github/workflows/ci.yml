@@ -15,7 +15,7 @@ jobs:
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.16.0
-      - run: zig fmt --check src test/tls_interop_server.zig build.zig
+      - run: zig fmt --check src test build.zig
       - run: zig build test --test-timeout 60s
       - run: zig build fuzz --fuzz=100K
       - run: zig build interop

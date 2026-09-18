@@ -49,5 +49,8 @@ pub fn main(init: std.process.Init) !void {
         .tls = .{ .auth = &auth },
         .on_request = onRequest,
     };
-    try linsang.connection.handle(io, stream, init.gpa, &config);
+    linsang.connection.handle(io, stream, init.gpa, &config) catch |err| switch (err) {
+        error.EndOfStream => {},
+        else => |e| return e,
+    };
 }

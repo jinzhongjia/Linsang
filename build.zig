@@ -38,10 +38,21 @@ pub fn build(b: *std.Build) void {
             .imports = &.{.{ .name = "Linsang", .module = mod }},
         }),
     });
-    const interop_cmd = b.addSystemCommand(&.{"sh"});
-    interop_cmd.addFileArg(b.path("test/tls_interop.sh"));
+    const interop_runner = b.addExecutable(.{
+        .name = "tls-interop",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/tls_interop.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const interop_cmd = b.addRunArtifact(interop_runner);
     interop_cmd.addArtifactArg(interop_server);
-    const interop_step = b.step("interop", "Test TLS with curl and OpenSSL");
+    interop_cmd.addFileArg(b.path("src/tls/testdata/server_cert.pem"));
+    interop_cmd.addFileArg(b.path("src/tls/testdata/server_key.pem"));
+    interop_cmd.addFileArg(b.path("src/tls/testdata/ecdsa_cert.pem"));
+    interop_cmd.addFileArg(b.path("src/tls/testdata/ec_prime256v1_private_key.pem"));
+    const interop_step = b.step("interop", "Test TLS with curl (and OpenSSL on POSIX)");
     interop_step.dependOn(&interop_cmd.step);
 
     // Tests: root.zig references every module, so this runs the whole suite.
