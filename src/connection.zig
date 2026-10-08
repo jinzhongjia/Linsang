@@ -154,16 +154,18 @@ pub const Connection = struct {
     closing: bool = false,
     close_notified: bool = false,
     stream_framing: enum { none, chunked, close_delimited } = .none,
+    socket: *TimedSocket,
     tls_connection: ?*tls.Connection = null,
     ws_peer_state: ?*WebSocketPeer.State = null,
     /// Mutate only through setWebSocketDeadline from connection callbacks.
     websocket_deadline: ?std.Io.Clock.Timestamp = null,
 
-    fn init(io: std.Io, stream: Stream, gpa: Allocator, cfg: *const Config) !Connection {
+    fn init(socket: *TimedSocket, gpa: Allocator, cfg: *const Config) !Connection {
         if (cfg.read_buffer_size < 4) return error.InvalidConfiguration;
         return .{
-            .io = io,
-            .stream = stream,
+            .io = socket.io,
+            .stream = socket.stream,
+            .socket = socket,
             .gpa = gpa,
             .cfg = cfg,
             .read_buf = try gpa.alloc(u8, cfg.read_buffer_size),
@@ -972,9 +974,143 @@ fn durationTimeout(duration: ?std.Io.Duration) std.Io.Timeout {
     } } else .none;
 }
 
-const ReadRace = union(enum) {
-    io: anyerror!usize,
-    timeout: std.Io.Cancelable!void,
+/// Socket reads and writes bounded by a deadline through `Io.operateTimeout`.
+/// The calling task waits itself (poll, or alertable I/O on Windows), so a
+/// bounded operation spawns no helper tasks. TLS reads and writes through
+/// `reader` and `writer`. Reads belong to the connection task and writes are
+/// serialized by their callers, so each direction keeps its own deadline.
+const TimedSocket = struct {
+    io: std.Io,
+    stream: Stream,
+    read_timeout: std.Io.Timeout = .none,
+    write_timeout: std.Io.Timeout = .none,
+    read_err: ?anyerror = null,
+    write_err: ?anyerror = null,
+    reader: std.Io.Reader,
+    writer: std.Io.Writer,
+
+    const max_iovecs_len = 8;
+    /// `operateTimeout` bounds only the wait for writability; the blocking
+    /// send that follows must fit in the space poll guarantees, or it blocks
+    /// past the deadline. BSD/macOS report writable with at least
+    /// `SO_SNDLOWAT` (2048) bytes free, Linux with about a third of the send
+    /// buffer (at least 1536 bytes). Larger bounded writes race a blocking
+    /// send against the deadline instead, which keeps bulk throughput.
+    const max_polled_write_len = 1024;
+
+    fn init(io: std.Io, stream: Stream, read_buffer: []u8, write_buffer: []u8) TimedSocket {
+        return .{
+            .io = io,
+            .stream = stream,
+            .reader = .{
+                .vtable = &.{ .stream = streamImpl, .readVec = readVec },
+                .buffer = read_buffer,
+                .seek = 0,
+                .end = 0,
+            },
+            .writer = .{
+                .vtable = &.{ .drain = drain },
+                .buffer = write_buffer,
+            },
+        };
+    }
+
+    fn read(self: *TimedSocket, data: [][]u8) !usize {
+        const result = try self.io.operateTimeout(.{ .net_read = .{
+            .socket_handle = self.stream.socket.handle,
+            .data = data,
+        } }, self.read_timeout);
+        return (try result.net_read).data_len;
+    }
+
+    /// Sends a prefix of `bytes`, bounded by `write_timeout`.
+    fn write(self: *TimedSocket, bytes: []const u8) !usize {
+        if (self.write_timeout == .none or bytes.len <= max_polled_write_len) {
+            const result = try self.io.operateTimeout(.{ .net_write = .{
+                .socket_handle = self.stream.socket.handle,
+                .data = &.{bytes},
+            } }, self.write_timeout);
+            return try result.net_write;
+        }
+        var results: [2]WriteRace = undefined;
+        var select = std.Io.Select(WriteRace).init(self.io, &results);
+        defer select.cancelDiscard();
+        try select.concurrent(.io, blockingWrite, .{ self.io, self.stream, bytes });
+        try select.concurrent(.timeout, std.Io.Timeout.sleep, .{ self.write_timeout, self.io });
+        return switch (try select.await()) {
+            .io => |result| try result,
+            .timeout => |result| {
+                try result;
+                return error.Timeout;
+            },
+        };
+    }
+
+    const WriteRace = union(enum) {
+        io: anyerror!usize,
+        timeout: std.Io.Cancelable!void,
+    };
+
+    fn blockingWrite(io: std.Io, stream: Stream, bytes: []const u8) anyerror!usize {
+        const result = try io.operate(.{ .net_write = .{
+            .socket_handle = stream.socket.handle,
+            .data = &.{bytes},
+        } });
+        return try result.net_write;
+    }
+
+    fn writeAll(self: *TimedSocket, bytes: []const u8) !void {
+        var rest = bytes;
+        while (rest.len != 0) rest = rest[try self.write(rest)..];
+    }
+
+    /// The error behind a failed TLS operation on this socket.
+    fn cause(self: *TimedSocket, err: anyerror) anyerror {
+        return switch (err) {
+            error.ReadFailed => self.read_err orelse err,
+            error.WriteFailed => self.write_err orelse err,
+            else => err,
+        };
+    }
+
+    fn streamImpl(io_r: *std.Io.Reader, io_w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
+        const dest = limit.slice(try io_w.writableSliceGreedy(1));
+        var data: [1][]u8 = .{dest};
+        const n = try readVec(io_r, &data);
+        io_w.advance(n);
+        return n;
+    }
+
+    fn readVec(io_r: *std.Io.Reader, data: [][]u8) std.Io.Reader.Error!usize {
+        const self: *TimedSocket = @alignCast(@fieldParentPtr("reader", io_r));
+        var iovecs_buffer: [max_iovecs_len][]u8 = undefined;
+        const dest_n, const data_size = try io_r.writableVector(&iovecs_buffer, data);
+        const n = self.read(iovecs_buffer[0..dest_n]) catch |err| {
+            self.read_err = err;
+            return error.ReadFailed;
+        };
+        if (n == 0) return error.EndOfStream;
+        if (n > data_size) {
+            io_r.end += n - data_size;
+            return data_size;
+        }
+        return n;
+    }
+
+    fn drain(io_w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+        const self: *TimedSocket = @alignCast(@fieldParentPtr("writer", io_w));
+        // Buffered bytes go first; otherwise the first non-empty data slice.
+        // Partial progress is fine: the writer calls drain again.
+        const buffered = io_w.buffered();
+        const next: []const u8 = if (buffered.len != 0) buffered else for (data, 0..) |slice, index| {
+            if (slice.len != 0 and (index + 1 < data.len or splat != 0)) break slice;
+        } else return 0;
+        const n = self.write(next) catch |err| {
+            self.write_err = err;
+            return error.WriteFailed;
+        };
+        return io_w.consume(n);
+    }
 };
 
 fn timedRead(
@@ -982,94 +1118,24 @@ fn timedRead(
     buffer: []u8,
     timeout: std.Io.Timeout,
 ) !usize {
-    const bounded = connection.boundedTimeout(timeout);
-    if (bounded == .none) return transportRead(connection, buffer);
-    var results: [2]ReadRace = undefined;
-    var select = std.Io.Select(ReadRace).init(connection.io, &results);
-    defer select.cancelDiscard();
-    try select.concurrent(.io, transportRead, .{ connection, buffer });
-    try select.concurrent(.timeout, waitTimeout, .{ connection.io, bounded });
-    return switch (try select.await()) {
-        .io => |result| try result,
-        .timeout => |result| {
-            try result;
-            return error.Timeout;
-        },
-    };
-}
-
-fn transportRead(connection: *Connection, buffer: []u8) !usize {
+    const socket = connection.socket;
+    socket.read_timeout = connection.boundedTimeout(timeout).toDeadline(connection.io);
     if (connection.tls_connection) |tls_connection|
-        return tls_connection.read(buffer);
-    var buffers = [1][]u8{buffer};
-    // Zig 0.17.0 Stream.read fails to compile; use readWithControl directly.
-    return (try connection.stream.readWithControl(connection.io, &buffers, &.{})).data_len;
+        return tls_connection.read(buffer) catch |err| socket.cause(err);
+    var data = [1][]u8{buffer};
+    return socket.read(&data);
 }
-
-const WriteRace = union(enum) {
-    io: anyerror!void,
-    timeout: std.Io.Cancelable!void,
-};
 
 fn timedWrite(
     connection: *Connection,
     bytes: []const u8,
     timeout: std.Io.Timeout,
 ) !void {
-    const bounded = connection.boundedTimeout(timeout);
-    if (bounded == .none) return transportWrite(connection, bytes);
-    var results: [2]WriteRace = undefined;
-    var select = std.Io.Select(WriteRace).init(connection.io, &results);
-    defer select.cancelDiscard();
-    try select.concurrent(.io, transportWrite, .{ connection, bytes });
-    try select.concurrent(.timeout, waitTimeout, .{ connection.io, bounded });
-    switch (try select.await()) {
-        .io => |result| try result,
-        .timeout => |result| {
-            try result;
-            return error.Timeout;
-        },
-    }
-}
-
-fn transportWrite(connection: *Connection, bytes: []const u8) !void {
+    const socket = connection.socket;
+    socket.write_timeout = connection.boundedTimeout(timeout).toDeadline(connection.io);
     if (connection.tls_connection) |tls_connection|
-        return tls_connection.writeAll(bytes);
-    var buffer: [1024]u8 = undefined;
-    var writer = connection.stream.writer(connection.io, &buffer);
-    try writer.interface.writeAll(bytes);
-    try writer.interface.flush();
-}
-
-fn waitTimeout(io: std.Io, timeout: std.Io.Timeout) std.Io.Cancelable!void {
-    try timeout.sleep(io);
-}
-
-const TlsHandshakeRace = union(enum) {
-    io: anyerror!tls.Connection,
-    timeout: std.Io.Cancelable!void,
-};
-
-fn tlsServerWithTimeout(
-    io: std.Io,
-    input: *std.Io.Reader,
-    output: *std.Io.Writer,
-    options: tls.ServerOptions,
-    timeout: std.Io.Timeout,
-) !tls.Connection {
-    if (timeout == .none) return tls.server(input, output, options);
-    var results: [2]TlsHandshakeRace = undefined;
-    var select = std.Io.Select(TlsHandshakeRace).init(io, &results);
-    defer select.cancelDiscard();
-    try select.concurrent(.io, tls.server, .{ input, output, options });
-    try select.concurrent(.timeout, waitTimeout, .{ io, timeout });
-    return switch (try select.await()) {
-        .io => |result| try result,
-        .timeout => |result| {
-            try result;
-            return error.Timeout;
-        },
-    };
+        return tls_connection.writeAll(bytes) catch |err| socket.cause(err);
+    return socket.writeAll(bytes);
 }
 
 pub fn handle(io: std.Io, stream: Stream, gpa: Allocator, cfg: *const Config) !void {
@@ -1079,33 +1145,31 @@ pub fn handle(io: std.Io, stream: Stream, gpa: Allocator, cfg: *const Config) !v
 
 /// Like `handle`, but the caller keeps ownership of `stream` and closes it.
 pub fn handleWithoutClose(io: std.Io, stream: Stream, gpa: Allocator, cfg: *const Config) !void {
-    var connection = try Connection.init(io, stream, gpa, cfg);
-    defer connection.deinit();
-
     if (cfg.tls) |tls_config| {
         var input_buffer: [tls.input_buffer_len]u8 = undefined;
         var output_buffer: [tls.output_buffer_len]u8 = undefined;
-        var input = stream.reader(io, &input_buffer);
-        var output = stream.writer(io, &output_buffer);
+        var socket: TimedSocket = .init(io, stream, &input_buffer, &output_buffer);
+        var connection = try Connection.init(&socket, gpa, cfg);
+        defer connection.deinit();
+        const handshake_timeout = durationTimeout(cfg.request_timeout).toDeadline(io);
+        socket.read_timeout = handshake_timeout;
+        socket.write_timeout = handshake_timeout;
         const rng_source: std.Random.IoSource = .{ .io = io };
-        var tls_connection = try tlsServerWithTimeout(
-            io,
-            &input.interface,
-            &output.interface,
-            .{
-                .rng = rng_source.interface(),
-                .auth = tls_config.auth,
-                .cipher_suites = tls_config.cipher_suites,
-                .alpn_protocols = &.{"http/1.1"},
-                .now = std.Io.Clock.real.now(io),
-            },
-            durationTimeout(cfg.request_timeout),
-        );
+        var tls_connection = tls.server(&socket.reader, &socket.writer, .{
+            .rng = rng_source.interface(),
+            .auth = tls_config.auth,
+            .cipher_suites = tls_config.cipher_suites,
+            .alpn_protocols = &.{"http/1.1"},
+            .now = std.Io.Clock.real.now(io),
+        }) catch |err| return socket.cause(err);
         connection.tls_connection = &tls_connection;
         defer tls_connection.close() catch {};
         defer connection.closePeer();
         return connection.run();
     }
+    var socket: TimedSocket = .init(io, stream, &.{}, &.{});
+    var connection = try Connection.init(&socket, gpa, cfg);
+    defer connection.deinit();
     try connection.run();
 }
 
@@ -2169,4 +2233,54 @@ test "canonical static paths are not decoded twice and remain contained" {
     );
     try testing.expect(std.mem.indexOf(u8, received, "canonical-file") != null);
     try testing.expect(std.mem.indexOf(u8, received, "wrong-file") == null);
+}
+
+test "timed socket bounds reads and writes and reports the cause through its interfaces" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{ .async_limit = .unlimited });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const streams = try tcpPair(io);
+    defer streams[0].close(io);
+    defer streams[1].close(io);
+
+    var read_buffer: [64]u8 = undefined;
+    var socket: TimedSocket = .init(io, streams[1], &read_buffer, &.{});
+    const short: std.Io.Timeout = .{ .duration = .{ .clock = .awake, .raw = .fromMilliseconds(20) } };
+
+    // Nothing arrives: the read waits on this task and times out.
+    socket.read_timeout = short.toDeadline(io);
+    var bytes: [8]u8 = undefined;
+    var data = [1][]u8{&bytes};
+    try testing.expectError(error.Timeout, socket.read(&data));
+
+    // Through the reader interface the failure is ReadFailed; cause() keeps it.
+    socket.read_timeout = short.toDeadline(io);
+    const failed = socket.reader.takeByte();
+    try testing.expectError(error.ReadFailed, failed);
+    try testing.expectEqual(error.Timeout, socket.cause(error.ReadFailed));
+
+    // Data that arrives in time is read.
+    try writeTest(streams[0], io, "hi");
+    socket.read_timeout = .{ .deadline = .fromNow(io, .{ .clock = .awake, .raw = .fromSeconds(5) }) };
+    try testing.expectEqual(@as(u8, 'h'), try socket.reader.takeByte());
+
+    // The peer never reads, so the send buffers fill and the write times out
+    // instead of blocking forever: first through the polled small-write path,
+    // then through the raced bulk path.
+    var small: [TimedSocket.max_polled_write_len]u8 = @splat('x');
+    socket.write_timeout = short.toDeadline(io);
+    const small_result = for (0..1 << 16) |_| {
+        socket.writeAll(&small) catch |err| break err;
+    } else error.NeverBlocked;
+    try testing.expectEqual(error.Timeout, small_result);
+    const chunk = try testing.allocator.alloc(u8, 1 << 20);
+    defer testing.allocator.free(chunk);
+    @memset(chunk, 'x');
+    socket.write_timeout = short.toDeadline(io);
+    const started = std.Io.Timestamp.now(io, .awake);
+    const result = for (0..64) |_| {
+        socket.writeAll(chunk) catch |err| break err;
+    } else error.NeverBlocked;
+    try testing.expectEqual(error.Timeout, result);
+    try testing.expect(started.durationTo(std.Io.Timestamp.now(io, .awake)).toMilliseconds() < 2000);
 }

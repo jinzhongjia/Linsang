@@ -107,9 +107,13 @@ This uses the pure protocol code in `http.zig` (`parseHead`, `decodeChunked`,
   This is heavier than the previous state-machine-per-connection but was accepted
   in exchange for stdlib-tested networking and simpler code. Keep buffers bounded
   and avoid deep recursion in handlers to keep stacks small.
-- Threaded deadlines use `std.Io.Select` tasks and therefore retain multiple
-  worker threads per live connection. `max_connections` defaults to 128 and
-  responds 503 to excess connections before closing them to keep that cost bounded.
+- Read, write, and TLS handshake deadlines go through a deadline-aware socket
+  reader/writer. Reads and writes up to 1 KiB use `std.Io.operateTimeout` on
+  the connection task itself (poll, or alertable I/O on Windows) and spawn no
+  helper tasks. A blocking send after poll is bounded only when it fits the
+  space poll guarantees, so larger bounded writes race a blocking send against
+  the deadline in a `std.Io.Select`. `max_connections` defaults to 128 and responds 503 to excess
+  connections before closing them.
 - Long-lived allocation via a caller-provided allocator (`std.heap.page_allocator`
   in the demo; the Evented runtime also needs a backing allocator).
 

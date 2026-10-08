@@ -100,6 +100,12 @@ Module map (target, all under `src/`):
   `Stream.socket.handle` is the raw fd/SOCKET.
 - Raw read for the incremental parser: `stream.readWithControl(io, &.{buf}, &.{}).data_len`
   → bytes (0 = EOF). Zig 0.17.0's `Stream.read` does not compile; avoid it. Simple writes: `Stream.writer` → `interface.writeAll` + `flush`.
+- Bounded connection I/O goes through `TimedSocket` (`connection.zig`):
+  `io.operateTimeout(.{ .net_read/.net_write = … }, deadline)` waits on the
+  calling task. Racing every operation against a sleep with `std.Io.Select`
+  spawns two tasks and was ~3x slower. Exception: a blocking send after poll
+  is bounded only up to the free space poll guarantees, so writes above
+  `max_polled_write_len` (1 KiB) keep the `Select` race.
 - Runtime: `std.Io.Evented.init(backing_allocator, .{ .thread_limit = … })`,
   `ev.io()`, `ev.deinit()`. Spawn work with `std.Io.Group` (`g.async(io, fn, args)`,
   `g.wait(io)` / `g.cancel(io)`), or `io.async` / `io.concurrent`.
