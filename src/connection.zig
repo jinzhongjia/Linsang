@@ -1074,6 +1074,11 @@ fn tlsServerWithTimeout(
 
 pub fn handle(io: std.Io, stream: Stream, gpa: Allocator, cfg: *const Config) !void {
     defer stream.close(io);
+    return handleWithoutClose(io, stream, gpa, cfg);
+}
+
+/// Like `handle`, but the caller keeps ownership of `stream` and closes it.
+pub fn handleWithoutClose(io: std.Io, stream: Stream, gpa: Allocator, cfg: *const Config) !void {
     var connection = try Connection.init(io, stream, gpa, cfg);
     defer connection.deinit();
 

@@ -176,7 +176,10 @@ For managed lifetimes, `try server.start(io)` binds synchronously and returns a
 `Running` handle. `running.address.getPort()` is therefore non-zero before the
 caller launches a dependent client when configured with port zero.
 `running.stop()` stops accepting, cancels active connections, and waits for
-their cleanup.
+their cleanup. It also shuts down every active socket and wakes the accept
+loop, so it finishes even when a cancelation is lost: Zig 0.17.0
+stack-capturing allocators can drop a pending cancelation, and void callbacks
+cannot propagate one.
 
 ## Design
 

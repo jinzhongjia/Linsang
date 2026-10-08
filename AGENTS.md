@@ -38,7 +38,9 @@ runtime**.
   buffers bounded and handler stacks shallow.
 - **Heavy unit tests**: every non-trivial function keeps a runnable test.
 - **Bounded time**: HTTP requests, keep-alive idle waits, and writes have
-  configurable deadlines; shutdown cancels and drains connection tasks.
+  configurable deadlines; shutdown cancels and drains connection tasks, and
+  also shuts down active sockets and wakes accept, because cancelation alone
+  can be lost (Zig 0.17.0 stack-capturing allocators, void callbacks).
 - **Bounded concurrency**: `max_connections` defaults to 128; excess accepted
   connections receive 503 and are closed immediately.
 
