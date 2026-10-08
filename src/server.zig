@@ -201,7 +201,7 @@ test "listen and serve HTTP over std.Io.net TCP" {
     var len: usize = 0;
     while (true) {
         var parts = [1][]u8{response[len..]};
-        const n = try io.vtable.netRead(io.userdata, client.socket.handle, &parts);
+        const n = (try client.readWithControl(io, &parts, &.{})).data_len;
         if (n == 0) break;
         len += n;
     }
@@ -233,7 +233,7 @@ test "start exposes the bound address and running server stops cleanly" {
     try writer.interface.flush();
     var response: [512]u8 = undefined;
     var parts = [1][]u8{&response};
-    const received = try io.vtable.netRead(io.userdata, client.socket.handle, &parts);
+    const received = (try client.readWithControl(io, &parts, &.{})).data_len;
     try testing.expect(std.mem.indexOf(u8, response[0..received], "you asked for /bound") != null);
     try running.stop();
 }
@@ -280,7 +280,7 @@ test "server enforces max connections" {
     try second_writer.interface.flush();
     var response: [128]u8 = undefined;
     var parts = [1][]u8{&response};
-    const received = try io.vtable.netRead(io.userdata, second.socket.handle, &parts);
+    const received = (try second.readWithControl(io, &parts, &.{})).data_len;
     try testing.expect(std.mem.startsWith(
         u8,
         response[0..received],
@@ -330,7 +330,7 @@ fn stressClient(io: std.Io, address: std.Io.net.IpAddress, id: usize) anyerror!v
     var len: usize = 0;
     while (len < response.len) {
         var parts = [1][]u8{response[len..]};
-        const n = try io.vtable.netRead(io.userdata, client.socket.handle, &parts);
+        const n = (try client.readWithControl(io, &parts, &.{})).data_len;
         if (n == 0) break;
         len += n;
     }

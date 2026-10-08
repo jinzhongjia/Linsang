@@ -23,10 +23,7 @@ pub const Method = enum {
     PATCH,
 
     pub fn fromSlice(s: []const u8) ?Method {
-        inline for (@typeInfo(Method).@"enum".fields) |f| {
-            if (std.mem.eql(u8, s, f.name)) return @enumFromInt(f.value);
-        }
-        return null;
+        return std.meta.stringToEnum(Method, s);
     }
 };
 
@@ -457,7 +454,7 @@ pub const Response = struct {
     }
 
     pub fn bodyAllowed(self: *const Response) bool {
-        const status_code = @intFromEnum(self.status);
+        const status_code = @backingInt(self.status);
         return status_code >= 200 and self.status != .no_content and self.status != .not_modified;
     }
 
@@ -477,7 +474,7 @@ pub const Response = struct {
         framing: Framing,
     ) !void {
         var line: [64]u8 = undefined;
-        const status_code = @intFromEnum(self.status);
+        const status_code = @backingInt(self.status);
         const body_allowed = self.bodyAllowed();
         const status_line = std.fmt.bufPrint(&line, "HTTP/1.1 {d} {s}\r\n", .{
             status_code, self.status.phrase(),

@@ -1002,11 +1002,8 @@ fn transportRead(connection: *Connection, buffer: []u8) !usize {
     if (connection.tls_connection) |tls_connection|
         return tls_connection.read(buffer);
     var buffers = [1][]u8{buffer};
-    return connection.io.vtable.netRead(
-        connection.io.userdata,
-        connection.stream.socket.handle,
-        &buffers,
-    );
+    // Zig 0.17.0 Stream.read fails to compile; use readWithControl directly.
+    return (try connection.stream.readWithControl(connection.io, &buffers, &.{})).data_len;
 }
 
 const WriteRace = union(enum) {
@@ -1239,7 +1236,7 @@ fn readUntil(stream: Stream, io: std.Io, buffer: []u8, needle: []const u8) ![]u8
     var len: usize = 0;
     while (std.mem.indexOf(u8, buffer[0..len], needle) == null) {
         var parts = [1][]u8{buffer[len..]};
-        const n = try io.vtable.netRead(io.userdata, stream.socket.handle, &parts);
+        const n = (try stream.readWithControl(io, &parts, &.{})).data_len;
         if (n == 0) break;
         len += n;
     }
@@ -1265,7 +1262,7 @@ fn readExact(stream: Stream, io: std.Io, buffer: []u8) !void {
     var len: usize = 0;
     while (len < buffer.len) {
         var parts = [1][]u8{buffer[len..]};
-        const n = try io.vtable.netRead(io.userdata, stream.socket.handle, &parts);
+        const n = (try stream.readWithControl(io, &parts, &.{})).data_len;
         if (n == 0) return error.EndOfStream;
         len += n;
     }
@@ -1842,7 +1839,7 @@ test "Expect continue and HEAD response semantics" {
     var parts = [1][]u8{&byte};
     try testing.expectEqual(
         @as(usize, 0),
-        try io.vtable.netRead(io.userdata, client.socket.handle, &parts),
+        (try client.readWithControl(io, &parts, &.{})).data_len,
     );
     try group.await(io);
 }
@@ -1904,7 +1901,7 @@ test "idle HTTP and WebSocket connections close and WebSocket close payloads are
     var parts = [1][]u8{&byte};
     try testing.expectEqual(
         @as(usize, 0),
-        try io.vtable.netRead(io.userdata, client.socket.handle, &parts),
+        (try client.readWithControl(io, &parts, &.{})).data_len,
     );
     try group.await(io);
 
@@ -2007,7 +2004,7 @@ test "outbound WebSocket peer sends immediately, serializes, and closes safely" 
     var frames: [send_count * 3]u8 = undefined;
     try readExact(client, io, &frames);
     for (&sends) |*future| try future.await(io);
-    var seen = [_]bool{false} ** send_count;
+    var seen: [send_count]bool = @splat(false);
     for (0..send_count) |index| {
         const frame = frames[index * 3 ..][0..3];
         try testing.expectEqualSlices(u8, &.{ 0x82, 1 }, frame[0..2]);

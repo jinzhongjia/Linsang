@@ -1,6 +1,6 @@
 # Linsang — Design
 
-A small, embeddable HTTP/1.1 + WebSocket server library in Zig 0.16, in the
+A small, embeddable HTTP/1.1 + WebSocket server library in Zig 0.17, in the
 spirit of civetweb. No `std.http`, no third-party deps, no libc where the OS
 permits it, low memory, heavy unit tests.
 
@@ -10,7 +10,7 @@ Networking now uses **`std.Io.net`** and accepts a **`std.Io` runtime**.
 The hand-rolled `socket.zig`, `poller.zig`, and reactor have been removed;
 `http.zig` and `websocket.zig` remain pure protocol code.
 
-Zig 0.16.0's Evented implementations currently expose unavailable network
+Zig 0.17.0's Evented implementations currently expose unavailable network
 vtable entries, so the runnable demo and tests use `std.Io.Threaded`.
 `std.Io.Evented` remains the fiber-per-connection target once stdlib networking
 support lands; no temporary socket backend is kept in this library.
@@ -42,7 +42,7 @@ The library accepts an `io: std.Io` and threads it through. Callers choose the
 implementation:
 
 - **`std.Io.Evented`** (target once networking is implemented) — an event-loop runtime that multiplexes
-  fibers over the OS's async facility. Per-OS mapping in 0.16:
+  fibers over the OS's async facility. Per-OS mapping in 0.17:
   - Linux → **io_uring** (`Uring`)
   - *BSD → `Kqueue`
   - macOS/iOS/… → **Dispatch / GCD**

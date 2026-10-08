@@ -1,6 +1,6 @@
 # Linsang
 
-A small, embeddable **HTTP/1.1 + WebSocket** server library in Zig 0.16, in the
+A small, embeddable **HTTP/1.1 + WebSocket** server library in Zig 0.17, in the
 spirit of [civetweb](https://github.com/civetweb/civetweb).
 
 - **No `std.http`** — the HTTP + WebSocket protocol code is our own.
@@ -19,7 +19,7 @@ spirit of [civetweb](https://github.com/civetweb/civetweb).
   certificates.
 
 > **Status:** the networking layer now uses `std.Io.net`; the previous
-> socket/poller/reactor has been removed. Zig 0.16.0's Evented network vtable is
+> socket/poller/reactor has been removed. Zig 0.17.0's Evented network vtable is
 > not implemented yet, so the runnable demo and tests currently use
 > `std.Io.Threaded`.
 

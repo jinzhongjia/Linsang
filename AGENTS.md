@@ -5,7 +5,7 @@ design; this file is the working brief.
 
 ## What this is
 
-A small embeddable **HTTP/1.1 + WebSocket** server library in **Zig 0.16**, in the
+A small embeddable **HTTP/1.1 + WebSocket** server library in **Zig 0.17**, in the
 spirit of civetweb. Optional server TLS supports TLS 1.2 and TLS 1.3.
 
 ## Status: `std.Io.net` migration landed (read this first)
@@ -18,7 +18,7 @@ runtime**.
   readiness poller).
 - `connection.zig` and `server.zig` use straight-line handlers and
   `std.Io.Group`, with no reactor state machine.
-- Zig 0.16.0's Evented network vtable is not implemented yet, so the runnable
+- Zig 0.17.0's Evented network vtable is still unavailable on io_uring and Dispatch, so the runnable
   demo and tests currently use `std.Io.Threaded`. Evented remains the target
   once stdlib support lands.
 
@@ -90,22 +90,26 @@ Module map (target, all under `src/`):
 | `connection.zig` | straight-line per-connection handler + `Config`/handler API |
 | `server.zig` | `std.Io.net` listen + accept loop + fiber-per-connection |
 
-## std.Io.net / runtime facts (0.16, verified)
+## std.Io.net / runtime facts (0.17, verified)
 
 - `IpAddress.parse/loopback/unspecified`, `.listen(io, options) → Server`,
   `Server.accept(io) → Stream`.
 - `Stream.reader(io, buf) / .writer(io, buf) / .close(io) / .shutdown(io, how)`;
   `Stream.socket.handle` is the raw fd/SOCKET.
-- Raw read for the incremental parser: `io.vtable.netRead(io.userdata, handle, &.{buf})`
-  → bytes (0 = EOF). Simple writes: `Stream.writer` → `interface.writeAll` + `flush`.
+- Raw read for the incremental parser: `stream.readWithControl(io, &.{buf}, &.{}).data_len`
+  → bytes (0 = EOF). Zig 0.17.0's `Stream.read` does not compile; avoid it. Simple writes: `Stream.writer` → `interface.writeAll` + `flush`.
 - Runtime: `std.Io.Evented.init(backing_allocator, .{ .thread_limit = … })`,
   `ev.io()`, `ev.deinit()`. Spawn work with `std.Io.Group` (`g.async(io, fn, args)`,
   `g.wait(io)` / `g.cancel(io)`), or `io.async` / `io.concurrent`.
 - `Server.AcceptOptions` is `void` on posix, a struct on Windows — handle both.
 
-## Zig 0.16 gotchas still relevant
+## Zig 0.17 gotchas still relevant
 
-- `std.ArrayList(T)` is unmanaged: init with `.empty`, methods take the allocator.
+- `std.ArrayList(T)` is unmanaged: init with `.empty` (it carries a
+  `pointer_stability` field), methods take the allocator.
+- `@typeInfo(E).@"enum"` exposes `field_names`/`field_values`/`mode`, not
+  `fields`/`is_exhaustive`; `[_]T{x} ** n` is gone, use `@splat`.
+- `b.args` is gone from `std.Build`; use `Run.addPassthruArgs()`.
 - Raw Linux syscalls (in `http.zig`/tests only now) return `usize`; convert with
   `std.os.linux.errno(rc)` → `linux.E` (no `E.init`).
 - Reader/Writer are `std.Io.Reader`/`Io.Writer` with a `.interface` field; pass

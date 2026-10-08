@@ -76,9 +76,9 @@ pub const Handshake = struct {
     client_random: [32]u8 = undefined,
     legacy_session_id_buf: [32]u8 = undefined,
     legacy_session_id: []u8 = &.{},
-    cipher_suite: CipherSuite = @enumFromInt(0),
-    signature_scheme: proto.SignatureScheme = @enumFromInt(0),
-    named_group: proto.NamedGroup = @enumFromInt(0),
+    cipher_suite: CipherSuite = @fromBackingInt(@intCast(0)),
+    signature_scheme: proto.SignatureScheme = @fromBackingInt(@intCast(0)),
+    named_group: proto.NamedGroup = @fromBackingInt(@intCast(0)),
     client_pub_key_buf: [max_pub_key_len]u8 = undefined,
     client_pub_key: []u8 = &.{},
     server_pub_key_buf: [max_pub_key_len]u8 = undefined,
@@ -591,12 +591,12 @@ pub const Handshake = struct {
             return error.TlsIllegalParameter;
 
         var key_share_received = false;
-        var supported_group: proto.NamedGroup = @enumFromInt(0);
+        var supported_group: proto.NamedGroup = @fromBackingInt(@intCast(0));
         var client_supports_12 = true;
         var client_supports_13 = false;
         var saw_supported_versions = false;
         var signature_supported = opt: {
-            if (@intFromEnum(h.signature_scheme) == 0) break :opt true;
+            if (@backingInt(h.signature_scheme) == 0) break :opt true;
             break :opt false;
         };
 
@@ -637,7 +637,7 @@ pub const Handshake = struct {
                     if (end_idx != extension_end) return error.TlsDecodeError;
                     while (d.idx < end_idx) {
                         const named_group = try d.decode(proto.NamedGroup);
-                        switch (@intFromEnum(named_group)) {
+                        switch (@backingInt(named_group)) {
                             0x0001...0x0016,
                             0x001a...0x001c,
                             0xff01...0xff02,
@@ -653,7 +653,7 @@ pub const Handshake = struct {
                             }
                         }
                     }
-                    if (@intFromEnum(h.named_group) == 0)
+                    if (@backingInt(h.named_group) == 0)
                         return error.TlsIllegalParameter;
                 },
                 .supported_groups => {
@@ -662,7 +662,7 @@ pub const Handshake = struct {
                     var selected_named_group_idx = supported_named_groups.len;
                     while (d.idx < end_idx) {
                         const named_group = try d.decode(proto.NamedGroup);
-                        switch (@intFromEnum(named_group)) {
+                        switch (@backingInt(named_group)) {
                             0x0001...0x0016,
                             0x001a...0x001c,
                             0xff01...0xff02,
@@ -749,9 +749,9 @@ pub const Handshake = struct {
 
         if (h.tls_version == .tls_1_3) {
             if (!key_share_received) return error.TlsMissingExtension;
-            if (@intFromEnum(h.named_group) == 0) return error.TlsIllegalParameter;
+            if (@backingInt(h.named_group) == 0) return error.TlsIllegalParameter;
         } else {
-            if (@intFromEnum(supported_group) == 0) return error.TlsHandshakeFailure;
+            if (@backingInt(supported_group) == 0) return error.TlsHandshakeFailure;
             h.named_group = supported_group;
             if (client_supports_13 and hasTls13Cipher(supported_cipher_suites))
                 h.server_random[24..32].* = "DOWNGRD\x01".*;
@@ -785,7 +785,7 @@ pub const Handshake = struct {
             if (!right_version) continue;
             var i: usize = 0;
             while (i < offered.len) : (i += 2)
-                if (std.mem.readInt(u16, offered[i..][0..2], .big) == @intFromEnum(candidate))
+                if (std.mem.readInt(u16, offered[i..][0..2], .big) == @backingInt(candidate))
                     return candidate;
         }
         return null;
@@ -830,7 +830,7 @@ fn fuzzClientHello(_: void, smith: *testing.Smith) !void {
 
     try h.cipher_suite.validate();
     try testing.expect(h.tls_version == .tls_1_2 or h.tls_version == .tls_1_3);
-    try testing.expect(@intFromEnum(h.named_group) != 0);
+    try testing.expect(@backingInt(h.named_group) != 0);
 }
 
 fn smithSliceCorpus(comptime input: []const u8) [4 + input.len]u8 {
@@ -930,7 +930,7 @@ pub const NonBlock = struct {
         client_flight_2,
 
         fn next(self: *State) void {
-            self.* = @enumFromInt(@intFromEnum(self.*) + 1);
+            self.* = @fromBackingInt(@intCast(@backingInt(self.*) + 1));
         }
     };
 

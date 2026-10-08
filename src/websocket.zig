@@ -84,7 +84,7 @@ pub const Opcode = enum(u4) {
     _,
 
     pub fn isControl(self: Opcode) bool {
-        return (@intFromEnum(self) & 0x8) != 0;
+        return (@backingInt(self) & 0x8) != 0;
     }
 
     pub fn isKnown(self: Opcode) bool {
@@ -129,7 +129,7 @@ pub fn parseFrame(buf: []u8, require_mask: bool) FrameResult {
     const b1 = buf[1];
     if ((b0 & 0x70) != 0) return .{ .fail = .protocol_error }; // RSV must be 0
     const fin = (b0 & 0x80) != 0;
-    const opcode: Opcode = @enumFromInt(@as(u4, @truncate(b0 & 0x0F)));
+    const opcode: Opcode = @fromBackingInt(@intCast(@as(u4, @truncate(b0 & 0x0F))));
     if (!opcode.isKnown()) return .{ .fail = .protocol_error };
     const masked = (b1 & 0x80) != 0;
     const len7: u7 = @truncate(b1 & 0x7F);
@@ -171,7 +171,7 @@ pub fn parseFrame(buf: []u8, require_mask: bool) FrameResult {
 
 /// Serialize a server-to-client frame header (never masked).
 pub fn frameHeader(buffer: *[10]u8, opcode: Opcode, payload_len: usize, fin: bool) []const u8 {
-    buffer[0] = (if (fin) @as(u8, 0x80) else 0) | @intFromEnum(opcode);
+    buffer[0] = (if (fin) @as(u8, 0x80) else 0) | @backingInt(opcode);
     var n: usize = 2;
     if (payload_len < 126) {
         buffer[1] = @intCast(payload_len);
@@ -201,7 +201,7 @@ pub fn writeText(out: *std.ArrayList(u8), gpa: Allocator, payload: []const u8) !
 
 pub fn writeClose(out: *std.ArrayList(u8), gpa: Allocator, code: CloseCode, reason: []const u8) !void {
     var payload: [125]u8 = undefined;
-    std.mem.writeInt(u16, payload[0..2], @intFromEnum(code), .big);
+    std.mem.writeInt(u16, payload[0..2], @backingInt(code), .big);
     const rlen = @min(reason.len, payload.len - 2);
     @memcpy(payload[2 .. 2 + rlen], reason[0..rlen]);
     try writeFrame(out, gpa, .close, payload[0 .. 2 + rlen], true);

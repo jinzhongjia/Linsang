@@ -14,7 +14,7 @@ jobs:
       - uses: actions/checkout@v6
       - uses: mlugg/setup-zig@v2
         with:
-          version: 0.16.0
+          version: 0.17.0
       - run: zig fmt --check src test build.zig
       - run: zig build test --test-timeout 60s
       - run: zig build fuzz --fuzz=100K
@@ -34,6 +34,6 @@ jobs:
       - uses: actions/checkout@v6
       - uses: mlugg/setup-zig@v2
         with:
-          version: 0.16.0
+          version: 0.17.0
           cache-key: ${{ matrix.target }}
       - run: zig build -Dtarget=${{ matrix.target }}

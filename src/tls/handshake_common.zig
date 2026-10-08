@@ -401,7 +401,7 @@ pub const CertificateParser = struct {
     pub_key_buf: [1038]u8 = undefined,
     pub_key: []const u8 = undefined,
 
-    signature_scheme: proto.SignatureScheme = @enumFromInt(0),
+    signature_scheme: proto.SignatureScheme = @fromBackingInt(@intCast(0)),
     signature_buf: [1024]u8 = undefined,
     signature: []const u8 = undefined,
 
@@ -577,7 +577,7 @@ pub const DhKeyPair = struct {
         var kp: DhKeyPair = .{};
         for (named_groups) |ng|
             switch (ng) {
-                .x25519 => kp.x25519_kp = try X25519.KeyPair.generateDeterministic(seed[0..][0..X25519.seed_length].*),
+                .x25519 => kp.x25519_kp = X25519.KeyPair.generateDeterministic(seed[0..][0..X25519.seed_length].*),
                 .secp256r1 => kp.secp256r1_kp = try EcdsaP256Sha256.KeyPair.generateDeterministic(seed[32..][0..EcdsaP256Sha256.KeyPair.seed_length].*),
                 .secp384r1 => kp.secp384r1_kp = try EcdsaP384Sha384.KeyPair.generateDeterministic(seed[32 + 32 ..][0..EcdsaP384Sha384.KeyPair.seed_length].*),
                 .x25519_ml_kem768 => kp.ml_kem768 = try MLKem768.KeyPair.generateDeterministic(seed[32 + 32 + 48 + 64 ..][0..MLKem768.seed_length].*),
@@ -687,7 +687,7 @@ test "CertificateBuilder.makeCertificateVerify ed25519" {
     // Bundle is unused by makeCertificateVerify (it only signs the
     // transcript with cert_key_pair.key), so an empty one is fine here.
     var cert_key_pair = CertKeyPair{
-        .bundle = .{ .map = .{}, .bytes = .{ .items = &.{}, .capacity = 0 } },
+        .bundle = .{ .map = .{}, .bytes = .empty },
         .key = try PrivateKey.parsePem(@embedFile("testdata/ed25519_private_key.pem")),
     };
     var transcript = Transcript{};

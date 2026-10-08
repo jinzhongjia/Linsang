@@ -27,7 +27,7 @@ fn onWsMessage(conn: *linsang.Connection, msg: ws.Message, ud: ?*anyopaque) void
 
 pub fn main() !void {
     const gpa = std.heap.page_allocator;
-    // ponytail: std.Io.Evented 0.16 has no net vtable yet; switch runtimes when
+    // ponytail: std.Io.Evented 0.17 has no io_uring/Dispatch net vtable yet; switch runtimes when
     // the stdlib implementation lands.
     var threaded = std.Io.Threaded.init(gpa, .{ .async_limit = .unlimited });
     defer threaded.deinit();
