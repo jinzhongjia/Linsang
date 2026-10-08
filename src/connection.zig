@@ -2176,7 +2176,10 @@ test "application WebSocket deadline cannot be renewed by control traffic" {
         };
         var header: [2]u8 = undefined;
         readExact(streams[0], io, &header) catch |err| {
-            if (err != error.EndOfStream) return err;
+            // Zig 0.17.0 reports Windows LOCAL_DISCONNECT as Unexpected.
+            const closed = err == error.EndOfStream or err == error.ConnectionResetByPeer or
+                (@import("builtin").os.tag == .windows and err == error.Unexpected);
+            if (!closed) return err;
             expired = true;
             break;
         };
