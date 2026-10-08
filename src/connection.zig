@@ -986,6 +986,10 @@ const TimedSocket = struct {
     write_timeout: std.Io.Timeout = .none,
     read_err: ?anyerror = null,
     write_err: ?anyerror = null,
+    /// Cleared once the Io cannot wait on socket operations with a timeout
+    /// (Zig 0.17.0 Threaded on Windows). Bounded operations then race a
+    /// blocking operation against the deadline, as before `operateTimeout`.
+    polled: std.atomic.Value(bool) = .init(true),
     reader: std.Io.Reader,
     writer: std.Io.Writer,
 
@@ -1016,27 +1020,41 @@ const TimedSocket = struct {
     }
 
     fn read(self: *TimedSocket, data: [][]u8) !usize {
-        const result = try self.io.operateTimeout(.{ .net_read = .{
+        const result = try self.bounded(.{ .net_read = .{
             .socket_handle = self.stream.socket.handle,
             .data = data,
-        } }, self.read_timeout);
+        } }, self.read_timeout, true);
         return (try result.net_read).data_len;
     }
 
     /// Sends a prefix of `bytes`, bounded by `write_timeout`.
     fn write(self: *TimedSocket, bytes: []const u8) !usize {
-        if (self.write_timeout == .none or bytes.len <= max_polled_write_len) {
-            const result = try self.io.operateTimeout(.{ .net_write = .{
-                .socket_handle = self.stream.socket.handle,
-                .data = &.{bytes},
-            } }, self.write_timeout);
-            return try result.net_write;
+        const result = try self.bounded(.{ .net_write = .{
+            .socket_handle = self.stream.socket.handle,
+            .data = &.{bytes},
+        } }, self.write_timeout, bytes.len <= max_polled_write_len);
+        return try result.net_write;
+    }
+
+    fn bounded(
+        self: *TimedSocket,
+        operation: std.Io.Operation,
+        timeout: std.Io.Timeout,
+        pollable: bool,
+    ) !std.Io.Operation.Result {
+        if (timeout == .none) return self.io.operate(operation);
+        if (pollable and self.polled.load(.monotonic)) {
+            if (self.io.operateTimeout(operation, timeout)) |result| return result else |err| switch (err) {
+                // Returned before the operation starts, so retrying is safe.
+                error.ConcurrencyUnavailable => self.polled.store(false, .monotonic),
+                else => |e| return e,
+            }
         }
-        var results: [2]WriteRace = undefined;
-        var select = std.Io.Select(WriteRace).init(self.io, &results);
+        var results: [2]Race = undefined;
+        var select = std.Io.Select(Race).init(self.io, &results);
         defer select.cancelDiscard();
-        try select.concurrent(.io, blockingWrite, .{ self.io, self.stream, bytes });
-        try select.concurrent(.timeout, std.Io.Timeout.sleep, .{ self.write_timeout, self.io });
+        try select.concurrent(.io, std.Io.operate, .{ self.io, operation });
+        try select.concurrent(.timeout, std.Io.Timeout.sleep, .{ timeout, self.io });
         return switch (try select.await()) {
             .io => |result| try result,
             .timeout => |result| {
@@ -1046,18 +1064,10 @@ const TimedSocket = struct {
         };
     }
 
-    const WriteRace = union(enum) {
-        io: anyerror!usize,
+    const Race = union(enum) {
+        io: std.Io.Cancelable!std.Io.Operation.Result,
         timeout: std.Io.Cancelable!void,
     };
-
-    fn blockingWrite(io: std.Io, stream: Stream, bytes: []const u8) anyerror!usize {
-        const result = try io.operate(.{ .net_write = .{
-            .socket_handle = stream.socket.handle,
-            .data = &.{bytes},
-        } });
-        return try result.net_write;
-    }
 
     fn writeAll(self: *TimedSocket, bytes: []const u8) !void {
         var rest = bytes;
@@ -2236,6 +2246,12 @@ test "canonical static paths are not decoded twice and remain contained" {
 }
 
 test "timed socket bounds reads and writes and reports the cause through its interfaces" {
+    // Polled (POSIX) and raced (Windows in Zig 0.17.0) waits.
+    try timedSocketCase(true);
+    try timedSocketCase(false);
+}
+
+fn timedSocketCase(polled: bool) !void {
     var threaded = std.Io.Threaded.init(testing.allocator, .{ .async_limit = .unlimited });
     defer threaded.deinit();
     const io = threaded.io();
@@ -2245,6 +2261,7 @@ test "timed socket bounds reads and writes and reports the cause through its int
 
     var read_buffer: [64]u8 = undefined;
     var socket: TimedSocket = .init(io, streams[1], &read_buffer, &.{});
+    socket.polled.store(polled, .monotonic);
     const short: std.Io.Timeout = .{ .duration = .{ .clock = .awake, .raw = .fromMilliseconds(20) } };
 
     // Nothing arrives: the read waits on this task and times out.

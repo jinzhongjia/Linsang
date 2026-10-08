@@ -20,6 +20,21 @@ jobs:
       - run: zig build fuzz --fuzz=100K
       - run: zig build interop
 
+  # Most socket tests are Linux-gated; these still exercise the platform's
+  # std.Io backend (Windows has no timed socket operations in Zig 0.17.0).
+  test-platforms:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
+      - run: zig build test --test-timeout 60s
+
   cross-compile:
     runs-on: ubuntu-latest
     strategy:
