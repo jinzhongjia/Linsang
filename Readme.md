@@ -145,10 +145,13 @@ its returned slice remains valid until the next read or next call.
 
 `Config` knobs: `tls`, `read_buffer_size`, `max_body_size`, `max_ws_message_size`,
 `request_timeout`, `keep_alive_timeout`, `write_timeout`, `backlog`, `max_connections`,
-`user_data`, and the `on_ws_open`/`on_ws_close` hooks. Set a timeout to `null`
-to disable it. `max_connections` defaults to 128; excess accepted connections
-receive 503 on plaintext listeners, or are closed before TLS negotiation, so
-Threaded cannot grow its worker pool without bound.
+`tcp_nodelay`, `user_data`, and the `on_ws_open`/`on_ws_close` hooks. Set a
+timeout to `null` to disable it. `max_connections` defaults to 128; excess
+accepted connections receive 503 on plaintext listeners, or are closed before
+TLS negotiation, so Threaded cannot grow its worker pool without bound.
+`tcp_nodelay` (default `true`) disables Nagle's algorithm on accepted sockets so
+small responses and WebSocket frames are not held back; a socket whose peer has
+already reset keeps the default and is still served.
 
 The `.files` action serves GET/HEAD below its opened directory. Directory URLs
 ending in `/` resolve to `index.html`; responses include a weak metadata ETag,

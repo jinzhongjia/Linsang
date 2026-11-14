@@ -53,6 +53,9 @@ pub const Config = struct {
     ws_idle_timeout: ?std.Io.Duration = .fromSeconds(60),
     /// Maximum time allowed to flush one HTTP response or WebSocket frame.
     write_timeout: ?std.Io.Duration = .fromSeconds(30),
+    /// Disable Nagle's algorithm on accepted sockets, so small responses and
+    /// WebSocket frames are sent at once instead of waiting for an ACK.
+    tcp_nodelay: bool = true,
     tls: ?TlsConfig = null,
 
     on_request: *const fn (*const http.Request, *http.Response, ?*anyopaque) Action,

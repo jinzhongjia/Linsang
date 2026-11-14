@@ -1,6 +1,7 @@
 //! `std.Io.net` listen/accept loop with one `std.Io.Group` task per connection.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const connection = @import("connection.zig");
 
 const Allocator = std.mem.Allocator;
@@ -219,9 +220,55 @@ fn serveLimitedConnection(
     defer stream.close(io);
     if (!server.shutdown.register(io, &entry)) return;
     defer server.shutdown.unregister(io, &entry);
+    if (server.config.tcp_nodelay) setNoDelay(io, stream);
     connection.handleWithoutClose(io, stream, server.gpa, &server.config) catch |err| {
         if (err == error.Canceled) return error.Canceled;
     };
+}
+
+/// Best effort: a socket the peer has already reset keeps Nagle enabled, and
+/// the connection is served anyway.
+fn setNoDelay(io: std.Io, stream: std.Io.net.Stream) void {
+    var enabled: u32 = 1;
+    noDelayOption(io, stream.socket.handle, .set, &enabled) catch {};
+}
+
+/// `std.posix.setsockopt` is unavailable on Windows and treats `EINVAL`, which
+/// macOS reports for a reset peer, as unreachable. Windows sockets are AFD
+/// handles, so the option travels as an AFD request like `std.Io.Threaded`'s.
+fn noDelayOption(
+    io: std.Io,
+    handle: std.Io.net.Socket.Handle,
+    mode: enum { set, get },
+    value: *u32,
+) !void {
+    if (builtin.os.tag == .windows) {
+        const windows = std.os.windows;
+        const info: windows.AFD.SOCKOPT_INFO = .{
+            .mode = switch (mode) {
+                .set => .set,
+                .get => .get,
+            },
+            .level = windows.ws2_32.IPPROTO.TCP,
+            .optname = windows.ws2_32.TCP.NODELAY,
+            .optval = value,
+            .optlen = @sizeOf(u32),
+        };
+        const result = try io.operate(.{ .device_io_control = .{
+            .file = .{ .handle = handle, .flags = .{ .nonblocking = true } },
+            .code = windows.IOCTL.AFD.SOCKOPT,
+            .in = std.mem.asBytes(&info),
+        } });
+        if (result.device_io_control.u.Status != .SUCCESS) return error.SocketOption;
+    } else {
+        const posix = std.posix;
+        var len: posix.socklen_t = @sizeOf(u32);
+        const rc = switch (mode) {
+            .set => posix.system.setsockopt(handle, posix.IPPROTO.TCP, posix.TCP.NODELAY, std.mem.asBytes(value), @sizeOf(u32)),
+            .get => posix.system.getsockopt(handle, posix.IPPROTO.TCP, posix.TCP.NODELAY, std.mem.asBytes(value), &len),
+        };
+        if (posix.errno(rc) != .SUCCESS) return error.SocketOption;
+    }
 }
 
 const http = @import("http.zig");
@@ -325,6 +372,44 @@ test "start exposes the bound address and running server stops cleanly" {
     const received = (try client.readWithControl(io, &parts, &.{})).data_len;
     try testing.expect(std.mem.indexOf(u8, response[0..received], "you asked for /bound") != null);
     try running.stop();
+}
+
+test "accepted sockets disable Nagle unless configured otherwise" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{ .async_limit = .unlimited });
+    defer threaded.deinit();
+    const io = threaded.io();
+    for ([_]bool{ true, false }) |enabled| {
+        var server = Server.init(testing.allocator, .{
+            .address = "127.0.0.1",
+            .port = 0,
+            .tcp_nodelay = enabled,
+            .on_request = okHandler,
+        });
+        var running = try server.start(io);
+        defer running.stop() catch {};
+        const client = try running.address.connect(io, .{ .mode = .stream });
+        defer client.close(io);
+        var write_buffer: [128]u8 = undefined;
+        var writer = client.writer(io, &write_buffer);
+        // Keep-alive holds the accepted socket registered after the reply.
+        try writer.interface.writeAll("GET /nodelay HTTP/1.1\r\nHost: x\r\n\r\n");
+        try writer.interface.flush();
+        var response: [512]u8 = undefined;
+        var parts = [1][]u8{&response};
+        const received = (try client.readWithControl(io, &parts, &.{})).data_len;
+        try testing.expect(std.mem.indexOf(u8, response[0..received], "you asked for /nodelay") != null);
+
+        const handle = handle: {
+            server.shutdown.mutex.lockUncancelable(io);
+            defer server.shutdown.mutex.unlock(io);
+            const node = server.shutdown.streams.first orelse return error.TestUnexpectedResult;
+            const entry: *Shutdown.Entry = @fieldParentPtr("node", node);
+            break :handle entry.stream.socket.handle;
+        };
+        var value: u32 = 0;
+        try noDelayOption(io, handle, .get, &value);
+        try testing.expectEqual(enabled, value != 0);
+    }
 }
 
 test "server enforces max connections" {
