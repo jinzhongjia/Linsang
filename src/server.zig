@@ -235,7 +235,9 @@ fn setNoDelay(io: std.Io, stream: std.Io.net.Stream) void {
 
 /// `std.posix.setsockopt` is unavailable on Windows and treats `EINVAL`, which
 /// macOS reports for a reset peer, as unreachable. Windows sockets are AFD
-/// handles, so the option travels as an AFD request like `std.Io.Threaded`'s.
+/// handles, so the option travels as an AFD request like `std.Io.Threaded`'s;
+/// Winsock rejects them as `WSAENOTSOCK`. An AFD get writes a one-byte
+/// boolean to the request's output buffer, not to `optval`.
 fn noDelayOption(
     io: std.Io,
     handle: std.Io.net.Socket.Handle,
@@ -244,6 +246,7 @@ fn noDelayOption(
 ) !void {
     if (builtin.os.tag == .windows) {
         const windows = std.os.windows;
+        if (mode == .get) value.* = 0;
         const info: windows.AFD.SOCKOPT_INFO = .{
             .mode = switch (mode) {
                 .set => .set,
@@ -258,6 +261,7 @@ fn noDelayOption(
             .file = .{ .handle = handle, .flags = .{ .nonblocking = true } },
             .code = windows.IOCTL.AFD.SOCKOPT,
             .in = std.mem.asBytes(&info),
+            .out = if (mode == .get) std.mem.asBytes(value) else &.{},
         } });
         if (result.device_io_control.u.Status != .SUCCESS) return error.SocketOption;
     } else {
