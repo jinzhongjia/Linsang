@@ -52,7 +52,7 @@ implementation:
 
 `fiber.supported` covers `x86_64`, `aarch64`, `riscv64`.
 
-Model: the server calls `IpAddress.listen(io, …)` then loops on `Server.accept(io)`;
+Model: the server binds an exclusive TCP listener (see `Server.listen`) then loops on `Server.accept(io)`;
 each accepted `Stream` is handed to a fiber via `std.Io.Group.async(io, handleConn, …)`.
 A connection normally lives entirely inside its fiber. The optional outbound
 WebSocket peer is the only shared state and uses a `std.Io.Mutex` to serialize

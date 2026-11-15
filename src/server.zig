@@ -17,13 +17,25 @@ pub const Server = struct {
         return .{ .gpa = gpa, .config = config };
     }
 
+    /// Bind without sharing the port. `IpAddress.listen` with `reuse_address`
+    /// also sets `SO_REUSEPORT` on POSIX and `SO_REUSEADDR` on Windows, which
+    /// let a second listener bind the same port without an error and take
+    /// part of its connections. POSIX keeps `SO_REUSEADDR` alone, which
+    /// rebinds over `TIME_WAIT` but never shares a listening port; Windows
+    /// binds with `SO_EXCLUSIVEADDRUSE`.
     pub fn listen(self: *const Server, io: std.Io) !NetServer {
         if (self.config.max_connections == 0) return error.InvalidConfiguration;
         const address = try std.Io.net.IpAddress.parse(self.config.address, self.config.port);
-        return address.listen(io, .{
-            .kernel_backlog = self.config.backlog,
-            .reuse_address = true,
-        });
+        return .{
+            .socket = if (builtin.os.tag == .windows)
+                try listenWindows(io, &address, self.config.backlog)
+            else
+                try listenPosix(&address, self.config.backlog),
+            .options = if (NetServer.AcceptOptions == void) {} else .{
+                .mode = .stream,
+                .protocol = null,
+            },
+        };
     }
 
     /// Bind synchronously, then serve in a background task. `Running.address`
@@ -226,6 +238,150 @@ fn serveLimitedConnection(
     };
 }
 
+fn listenPosix(address: *const std.Io.net.IpAddress, backlog: u31) !std.Io.net.Socket {
+    const posix = std.posix;
+    const Threaded = std.Io.Threaded;
+    const flags: u32 = posix.SOCK.STREAM |
+        if (Threaded.socket_flags_unsupported) 0 else posix.SOCK.CLOEXEC;
+    const rc = posix.system.socket(Threaded.posixAddressFamily(address), flags, 0);
+    switch (posix.errno(rc)) {
+        .SUCCESS => {},
+        .AFNOSUPPORT => return error.AddressFamilyUnsupported,
+        .MFILE => return error.ProcessFdQuotaExceeded,
+        .NFILE => return error.SystemFdQuotaExceeded,
+        .NOBUFS, .NOMEM => return error.SystemResources,
+        else => return error.Unexpected,
+    }
+    const fd: posix.fd_t = @intCast(rc);
+    errdefer _ = posix.system.close(fd);
+    if (Threaded.socket_flags_unsupported and
+        posix.errno(posix.system.fcntl(fd, posix.F.SETFD, @as(usize, posix.FD_CLOEXEC))) != .SUCCESS)
+        return error.Unexpected;
+    const enabled: c_int = 1;
+    if (posix.errno(posix.system.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, std.mem.asBytes(&enabled), @sizeOf(c_int))) != .SUCCESS)
+        return error.Unexpected;
+    var storage: Threaded.PosixAddress = undefined;
+    var len = Threaded.addressToPosix(address, &storage);
+    switch (posix.errno(posix.system.bind(fd, &storage.any, len))) {
+        .SUCCESS => {},
+        .ADDRINUSE => return error.AddressInUse,
+        .ADDRNOTAVAIL => return error.AddressUnavailable,
+        .ACCES, .PERM => return error.AccessDenied,
+        else => return error.Unexpected,
+    }
+    switch (posix.errno(posix.system.listen(fd, backlog))) {
+        .SUCCESS => {},
+        .ADDRINUSE => return error.AddressInUse,
+        else => return error.Unexpected,
+    }
+    if (posix.errno(posix.system.getsockname(fd, &storage.any, &len)) != .SUCCESS)
+        return error.Unexpected;
+    return .{ .handle = fd, .address = Threaded.addressFromPosix(&storage) };
+}
+
+/// Like `std.Io.Threaded`'s AFD listener, plus `SO_EXCLUSIVEADDRUSE`, which
+/// must be set before binding.
+fn listenWindows(
+    io: std.Io,
+    address: *const std.Io.net.IpAddress,
+    backlog: u31,
+) !std.Io.net.Socket {
+    const windows = std.os.windows;
+    const posix = std.posix;
+    const Threaded = std.Io.Threaded;
+    var handle: windows.HANDLE = undefined;
+    var iosb: windows.IO_STATUS_BLOCK = undefined;
+    switch (windows.ntdll.NtCreateFile(
+        &handle,
+        .{
+            .STANDARD = .{ .RIGHTS = .{ .WRITE_DAC = true }, .SYNCHRONIZE = true },
+            .GENERIC = .{ .WRITE = true, .READ = true },
+        },
+        &.{
+            .ObjectName = @constCast(&windows.UNICODE_STRING.init(
+                windows.AFD.DEVICE_NAME ++ .{ '\\', 'E', 'n', 'd', 'p', 'o', 'i', 'n', 't' },
+            )),
+        },
+        &iosb,
+        null,
+        .{},
+        .{ .READ = true, .WRITE = true },
+        .OPEN_IF,
+        .{ .IO = .ASYNCHRONOUS },
+        &windows.AFD.OPEN_PACKET.FULL_EA_INFORMATION{ .Value = .{
+            .EndpointType = .{},
+            .GroupID = 0,
+            .AddressFamily = Threaded.posixAddressFamily(address),
+            .SocketType = posix.SOCK.STREAM,
+            .Protocol = posix.IPPROTO.TCP,
+            .TransportDeviceNameLength = 0,
+            .TransportDeviceName = undefined,
+        } },
+        @sizeOf(windows.AFD.OPEN_PACKET.FULL_EA_INFORMATION),
+    )) {
+        .SUCCESS => {},
+        .PROTOCOL_NOT_SUPPORTED => return error.AddressFamilyUnsupported,
+        .INSUFFICIENT_RESOURCES => return error.SystemResources,
+        else => return error.Unexpected,
+    }
+    errdefer windows.CloseHandle(handle);
+
+    // `SO_EXCLUSIVEADDRUSE` is `~SO_REUSEADDR`.
+    const exclusive: u32 = 1;
+    const option: windows.AFD.SOCKOPT_INFO = .{
+        .mode = .set,
+        .level = windows.ws2_32.SOL.SOCKET,
+        .optname = ~@as(u32, windows.ws2_32.SO.REUSEADDR),
+        .optval = &exclusive,
+        .optlen = @sizeOf(u32),
+    };
+    try afdControl(io, handle, windows.IOCTL.AFD.SOCKOPT, std.mem.asBytes(&option), &.{});
+
+    const Bind = extern struct { info: windows.AFD.BIND_INFO, address: Threaded.PosixAddress };
+    var bind: Bind = .{ .info = .{ .Mode = .Passive }, .address = undefined };
+    const len = Threaded.addressToPosix(address, &bind.address);
+    afdControl(
+        io,
+        handle,
+        windows.IOCTL.AFD.BIND,
+        std.mem.asBytes(&bind)[0 .. @offsetOf(Bind, "address") + len],
+        std.mem.asBytes(&bind.address)[0..len],
+    ) catch |err| switch (err) {
+        error.SharingViolation, error.AddressAlreadyExists => return error.AddressInUse,
+        else => return err,
+    };
+    const listen_info: windows.AFD.LISTEN_INFO = .{
+        .UseSAN = .FALSE,
+        .MaximumConnectionQueue = backlog,
+        .UseDelayedAcceptance = .FALSE,
+    };
+    try afdControl(io, handle, windows.IOCTL.AFD.START_LISTEN, std.mem.asBytes(&listen_info), &.{});
+    return .{ .handle = handle, .address = Threaded.addressFromPosix(&bind.address) };
+}
+
+fn afdControl(
+    io: std.Io,
+    handle: std.Io.net.Socket.Handle,
+    code: std.os.windows.CTL_CODE,
+    in: []const u8,
+    out: []u8,
+) !void {
+    const result = try io.operate(.{ .device_io_control = .{
+        .file = .{ .handle = handle, .flags = .{ .nonblocking = true } },
+        .code = code,
+        .in = in,
+        .out = out,
+    } });
+    return switch (result.device_io_control.u.Status) {
+        .SUCCESS => {},
+        .SHARING_VIOLATION => error.SharingViolation,
+        .ADDRESS_ALREADY_EXISTS => error.AddressAlreadyExists,
+        .ACCESS_DENIED => error.AccessDenied,
+        .INSUFFICIENT_RESOURCES => error.SystemResources,
+        else => error.Unexpected,
+    };
+}
+
 /// Best effort: a socket the peer has already reset keeps Nagle enabled, and
 /// the connection is served anyway.
 fn setNoDelay(io: std.Io, stream: std.Io.net.Stream) void {
@@ -414,6 +570,55 @@ test "accepted sockets disable Nagle unless configured otherwise" {
         try noDelayOption(io, handle, .get, &value);
         try testing.expectEqual(enabled, value != 0);
     }
+}
+
+test "listeners never share a port and rebind it after stopping" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{ .async_limit = .unlimited });
+    defer threaded.deinit();
+    const io = threaded.io();
+    var first = Server.init(testing.allocator, .{
+        .address = "127.0.0.1",
+        .port = 0,
+        .on_request = okHandler,
+    });
+    var running = try first.start(io);
+    var stopped = false;
+    defer if (!stopped) running.stop() catch {};
+    const port = running.address.getPort();
+
+    var second = Server.init(testing.allocator, .{
+        .address = "127.0.0.1",
+        .port = port,
+        .on_request = okHandler,
+    });
+    try testing.expectError(error.AddressInUse, second.start(io));
+    // Nor may a socket that asks to share the port (`SO_REUSEPORT` on
+    // POSIX, `SO_REUSEADDR` on Windows).
+    const address = try std.Io.net.IpAddress.parse("127.0.0.1", port);
+    try testing.expectError(error.AddressInUse, address.listen(io, .{ .reuse_address = true }));
+
+    // The server closes first, leaving its side in TIME_WAIT.
+    const client = try running.address.connect(io, .{ .mode = .stream });
+    defer client.close(io);
+    var write_buffer: [128]u8 = undefined;
+    var writer = client.writer(io, &write_buffer);
+    try writer.interface.writeAll("GET /close HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+    try writer.interface.flush();
+    var response: [512]u8 = undefined;
+    var received: usize = 0;
+    while (true) {
+        var parts = [1][]u8{response[received..]};
+        const count = (try client.readWithControl(io, &parts, &.{})).data_len;
+        if (count == 0) break;
+        received += count;
+    }
+    try testing.expect(std.mem.indexOf(u8, response[0..received], "you asked for /close") != null);
+    try running.stop();
+    stopped = true;
+
+    var restarted = try second.start(io);
+    defer restarted.stop() catch {};
+    try testing.expectEqual(port, restarted.address.getPort());
 }
 
 test "server enforces max connections" {

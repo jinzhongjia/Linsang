@@ -178,7 +178,11 @@ reads/writes. Clear it with `null` after authentication to resume
 
 For managed lifetimes, `try server.start(io)` binds synchronously and returns a
 `Running` handle. `running.address.getPort()` is therefore non-zero before the
-caller launches a dependent client when configured with port zero.
+caller launches a dependent client when configured with port zero. The
+listener never shares its port: binding a port another listener holds returns
+`error.AddressInUse`, even against sockets that request sharing. POSIX sets
+only `SO_REUSEADDR`, so a stopped server's port rebinds over `TIME_WAIT`;
+Windows binds with `SO_EXCLUSIVEADDRUSE`.
 `running.stop()` stops accepting, cancels active connections, and waits for
 their cleanup. It also shuts down every active socket and wakes the accept
 loop, so it finishes even when a cancelation is lost: Zig 0.17.0
@@ -187,7 +191,7 @@ cannot propagate one.
 
 ## Design
 
-See [docs/DESIGN.md](docs/DESIGN.md). In short: `IpAddress.listen(io)` → accept
+See [docs/DESIGN.md](docs/DESIGN.md). In short: an exclusive TCP listener → accept
 loop → one task per connection via `std.Io.Group`. Ordinary connection state
 lives entirely inside its task; the optional outbound WebSocket handle uses one
 `std.Io.Mutex` to serialize frames. Under Evented the task is a fiber; under
