@@ -279,8 +279,9 @@ fn listenPosix(address: *const std.Io.net.IpAddress, backlog: u31) !std.Io.net.S
     return .{ .handle = fd, .address = Threaded.addressFromPosix(&storage) };
 }
 
-/// Like `std.Io.Threaded`'s AFD listener, plus `SO_EXCLUSIVEADDRUSE`, which
-/// must be set before binding.
+/// Like `std.Io.Threaded`'s AFD listener, but bound exclusively. Winsock
+/// implements `SO_EXCLUSIVEADDRUSE` as the bind request's share type, not as
+/// an AFD socket option.
 fn listenWindows(
     io: std.Io,
     address: *const std.Io.net.IpAddress,
@@ -326,19 +327,11 @@ fn listenWindows(
     }
     errdefer windows.CloseHandle(handle);
 
-    // `SO_EXCLUSIVEADDRUSE` is `~SO_REUSEADDR`.
-    const exclusive: u32 = 1;
-    const option: windows.AFD.SOCKOPT_INFO = .{
-        .mode = .set,
-        .level = windows.ws2_32.SOL.SOCKET,
-        .optname = ~@as(u32, windows.ws2_32.SO.REUSEADDR),
-        .optval = &exclusive,
-        .optlen = @sizeOf(u32),
-    };
-    try afdControl(io, handle, windows.IOCTL.AFD.SOCKOPT, std.mem.asBytes(&option), &.{});
-
+    // AFD share types: unique 0, reuse 1 (std's `.Passive`), wildcard 2
+    // (`.Active`), exclusive 3.
+    const share_exclusive: windows.AFD.BIND_INFO.MODE = @enumFromInt(3);
     const Bind = extern struct { info: windows.AFD.BIND_INFO, address: Threaded.PosixAddress };
-    var bind: Bind = .{ .info = .{ .Mode = .Passive }, .address = undefined };
+    var bind: Bind = .{ .info = .{ .Mode = share_exclusive }, .address = undefined };
     const len = Threaded.addressToPosix(address, &bind.address);
     afdControl(
         io,
