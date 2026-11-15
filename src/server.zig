@@ -329,7 +329,7 @@ fn listenWindows(
 
     // AFD share types: unique 0, reuse 1 (std's `.Passive`), wildcard 2
     // (`.Active`), exclusive 3.
-    const share_exclusive: windows.AFD.BIND_INFO.MODE = @enumFromInt(3);
+    const share_exclusive: windows.AFD.BIND_INFO.MODE = @fromBackingInt(@intCast(3));
     const Bind = extern struct { info: windows.AFD.BIND_INFO, address: Threaded.PosixAddress };
     var bind: Bind = .{ .info = .{ .Mode = share_exclusive }, .address = undefined };
     const len = Threaded.addressToPosix(address, &bind.address);
@@ -586,9 +586,13 @@ test "listeners never share a port and rebind it after stopping" {
     });
     try testing.expectError(error.AddressInUse, second.start(io));
     // Nor may a socket that asks to share the port (`SO_REUSEPORT` on
-    // POSIX, `SO_REUSEADDR` on Windows).
+    // POSIX, `SO_REUSEADDR` on Windows). Windows refuses it with
+    // `ACCESS_DENIED`, which `std` reports as `error.Unexpected`.
     const address = try std.Io.net.IpAddress.parse("127.0.0.1", port);
-    try testing.expectError(error.AddressInUse, address.listen(io, .{ .reuse_address = true }));
+    try testing.expectError(
+        if (builtin.os.tag == .windows) error.Unexpected else error.AddressInUse,
+        address.listen(io, .{ .reuse_address = true }),
+    );
 
     // The server closes first, leaving its side in TIME_WAIT.
     const client = try running.address.connect(io, .{ .mode = .stream });
